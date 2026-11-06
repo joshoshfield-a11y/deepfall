@@ -1,25 +1,47 @@
-# player.gd — side-view platformer, grid collision against foreground blocks.
-# Coyote time 0.12s, jump buffer 0.12s, double jump. Platforms are one-way:
-# collision only when falling and the player's feet were above the platform.
+# player.gd — DEEPFALL side-view platformer hero (Phase 11 physics pass).
+#
+# Grid collision against foreground blocks (solid = t != 0 and t != 7;
+# 7 = one-way platform landed on only from above) PLUS solid collision
+# with physics props (crates / barrels / pots, see phys_prop.gd): the
+# hero stands on them and pushes the pushable ones while on the ground.
+#
+# Phase 11 movement model (was: velocity snapped to input every frame,
+# which silently cancelled all knockback):
+#   * acceleration / friction on the ground, softer air control
+#   * variable jump height (release JUMP early = shorter hop), apex
+#     hang while JUMP is held, heavier gravity when falling
+#   * coyote 0.12 s, jump buffer 0.12 s, double jump (kept)
+#   * real knockback: hits launch the hero up and away; control is
+#     reduced for 0.25 s so the impulse actually plays out
+#   * skills: DASH (burst + i-frames, one air dash per airtime) and
+#     SLAM (in air: dive; landing sends a shockwave that knocks enemies
+#     back and breaks / launches props)
+#   * aim vector (right stick / mouse) drives swing direction and the
+#     rig's arm, and the camera leans slightly toward it
+# Visuals: the Terraria-style pixel paper-doll (hero_rig.gd). The legacy
+# frame sets are still loaded for the older self-tests, but hidden.
 extends Node2D
 
 const TILE := 64
-const SPEED := 260.0
-const JUMP_VEL := -620.0
+const SPEED := 270.0
+const JUMP_VEL := -640.0
 const GRAVITY := 1800.0
+const FALL_MULT := 1.3
+const APEX_MULT := 0.55
+const JUMP_CUT := 0.45
 const COYOTE := 0.12
 const BUFFER := 0.12
+const ACCEL_GROUND := 2600.0
+const ACCEL_AIR := 1600.0
+const FRICTION := 3000.0
+const MAX_FALL := 1150.0
+const DASH_SPEED := 760.0
+const DASH_TIME := 0.16
+const DASH_COOLDOWN := 0.75
+const SLAM_SPEED := 1300.0
+const SLAM_COOLDOWN := 1.4
+const SWING_TIME := 0.38
 
-# Phase 8: three starting classes (the user's pick — tech soldier, hooded
-# mage, red soldier). The skeleton hero is a SEPARATE/unlockable hero, NOT
-# a fourth starting class, and is not selectable here.
-# Per-class frame counts (assets/player_anim/<class>/, MANIFEST.json):
-# tech loads from the flat assets/player_anim/ root (Phases 2-4 layout);
-# red/mage load from their own subfolders. Sets with count 0 are not
-# loaded. No fall/land frames exist for red or mage: airborne reuses
-# thruster frame 0 and landing reuses the lowest crouch frame (real
-# frames of that character, documented in the README) — distinct
-# fall/land poses are still missing for red/mage.
 const CLASS_DATA := {
 	"tech": {"name": "Tech Soldier", "max_hp": 100, "melee": 15,
 		"speed": 1.0, "ranged": false,
@@ -37,6 +59,8 @@ const CLASS_DATA := {
 			"fall": 0, "melee": 4, "reload": 7, "thruster": 5,
 			"dying": 5, "crouch": 4, "climb": 4, "swim": 4}},
 }
+const HERO_RIG := preload("res://scripts/hero_rig.gd")
+
 var class_id := "tech"
 var class_display_name := "Tech Soldier"
 var melee_dmg := 15
@@ -56,16 +80,24 @@ var half_h := 40.0
 var _prev_jump := false
 var touch_move := 0.0
 var touch_jump := false
-# Phase 9: touch down = crouch while held on the ground; down + jump on a
-# one-way platform = drop through it (same as S / Down + jump on desktop).
 var touch_crouch := false
 var touch_drop := false
+# Phase 11: aim (unit vector, world space). aiming = right stick held.
+var aim := Vector2(1, 0)
+var aiming := false
 var _drop_timer := 0.0
 var _dying_timer := 0.0
 var _double_jumped := false
 var _crouching := false
-# Phase 5 combat: HP, melee (J / touch ATK), hurt invulnerability, death.
-# Melee is J ONLY on desktop — left-click stays mining (main._input).
+var _jump_cut_done := false
+var _kb_timer := 0.0
+var dash_timer := 0.0
+var dash_cooldown := 0.0
+var _air_dash_used := false
+var slam_active := false
+var slam_cooldown := 0.0
+var _dust_timer := 0.0
+var _fall_peak := 0.0
 var max_hp := 100
 var hp := 100
 var attack_cooldown := 0.0
@@ -73,6 +105,7 @@ var attack_timer := 0.0
 var hurt_timer := 0.0
 var dead := false
 var _attack_struck := false
+var _swing_aim := Vector2(1, 0)
 var _anim_melee: Array = []
 var _anim_reload: Array = []
 var _anim_thruster: Array = []
@@ -80,61 +113,49 @@ var _anim_dying: Array = []
 var _anim_crouch: Array = []
 var _anim_climb: Array = []
 var _anim_swim: Array = []
-# Phase 2 animation: frames sliced from the staged tech-soldier strips,
-# bottom-centre on a common 128x195 canvas (see build_assets.py).
-# Phase 4: walkcycle/fall wired from atlas-art/sliced/tech-walk-cycle and
-# tech-fall-land, normalised to a common 256x195 canvas at the same 0.5
-# scale (feet still land at +40px). Fall uses frames 0-2 ONLY: frame 3 of
-# the source sheet is a front-facing standing pose, not a land pose.
 var _anim_idle: Array = []
 var _anim_walk: Array = []
 var _anim_walkcycle: Array = []
 var _anim_fall: Array = []
 var _anim_shoot: Array = []
 var _anim_time := 0.0
-var _anim_state := "idle"
 var _shoot_timer := 0.0
 var _land_timer := 0.0
 var _was_airborne := false
-# Phase 10: equipped tool ("pickaxe" mines, weak 5-dmg attack; "sword"
-# = class melee, cannot mine). Both owned from the start; main owns the
-# authoritative copy and pushes it here via set_tool().
 var tool := "pickaxe"
 var _strike_dmg := 5
-# Phase 10 procedural fluidity: walk cycle phase (frame units, 8 fps),
-# jump-takeoff stretch timer, rim-glow sprite, melee slash arc.
-var _walk_phase := 0.0
 var _stretch_timer := 0.0
-var _rim: Sprite2D = null
-var _slash: Polygon2D = null
+var rig: Node2D = null
+var _light: PointLight2D = null
+var _cam_look := Vector2.ZERO
 @onready var _sprite: Sprite2D = $Sprite2D
 
 func _ready() -> void:
-	# Phase 10 rim: a slightly larger warm copy of the sprite drawn
-	# BEHIND it (z -1) so the dark soldier reads against dark rock.
-	# Visual only — collision is grid data, untouched.
-	_rim = Sprite2D.new()
-	_rim.z_index = -1
-	_rim.modulate = Color(1.0, 0.78, 0.42, 0.5)
-	add_child(_rim)
-	# Phase 10 slash arc: a sector that sweeps with the melee swing so
-	# the slash reads ATTACHED to the character instead of detached.
-	_slash = Polygon2D.new()
-	var pts := PackedVector2Array([Vector2.ZERO])
-	var radius := 78.0
-	for deg in range(-75, 76, 15):
-		var a := deg_to_rad(float(deg))
-		pts.append(Vector2(cos(a), sin(a)) * radius)
-	_slash.polygon = pts
-	_slash.color = Color(0.65, 0.85, 1.0, 0.85)
-	_slash.position = Vector2(0, -20)
-	_slash.visible = false
-	add_child(_slash)
+	_sprite.visible = false
+	z_index = 3
+	rig = HERO_RIG.new()
+	rig.name = "Rig"
+	add_child(rig)
+	# Soft personal light so the hero always reads against dark rock.
+	_light = PointLight2D.new()
+	var gt := GradientTexture2D.new()
+	gt.width = 256; gt.height = 256
+	gt.fill = GradientTexture2D.FILL_RADIAL
+	gt.fill_from = Vector2(0.5, 0.5)
+	gt.fill_to = Vector2(1.0, 0.5)
+	var gr := Gradient.new()
+	gr.set_color(0, Color(1, 1, 1, 1))
+	gr.set_color(1, Color(1, 1, 1, 0))
+	gt.gradient = gr
+	_light.texture = gt
+	_light.texture_scale = 1.6
+	_light.energy = 0.55
+	_light.color = Color(1.0, 0.85, 0.65)
+	_light.position = Vector2(0, -10)
+	add_child(_light)
 	set_class("tech")
 
 func set_class(id: String) -> void:
-	# (Re)loads every animation set for the class and applies its stats.
-	# Main calls this on class pick, on save load, and on new run.
 	if not CLASS_DATA.has(id):
 		id = "tech"
 	var cd: Dictionary = CLASS_DATA[id]
@@ -148,109 +169,137 @@ func set_class(id: String) -> void:
 	var base := "res://assets/player_anim/"
 	if id != "tech":
 		base = "res://assets/player_anim/%s/" % id
-	_anim_idle.clear()
-	_anim_walk.clear()
-	_anim_shoot.clear()
-	_anim_walkcycle.clear()
-	_anim_fall.clear()
-	_anim_melee.clear()
-	_anim_reload.clear()
-	_anim_thruster.clear()
-	_anim_dying.clear()
-	_anim_crouch.clear()
-	_anim_climb.clear()
-	_anim_swim.clear()
 	for set_name in ["idle", "walk", "shoot", "walkcycle", "fall", "melee",
 			"reload", "thruster", "dying", "crouch", "climb", "swim"]:
 		var arr: Array = get("_anim_" + set_name)
+		arr.clear()
 		for i in range(int(counts.get(set_name, 0))):
 			arr.append(load(base + "%s_%d.png" % [set_name, i]))
 	_anim_time = 0.0
 	_shoot_timer = 0.0
 	_land_timer = 0.0
-	_walk_phase = 0.0
 	_stretch_timer = 0.0
 	attack_timer = 0.0
 	attack_cooldown = 0.0
 	if not dead:
 		hp = max_hp
-	_sprite.position = Vector2(0, -8.75)  # feet at +40px (half_h) with 195px canvas at 0.5 scale
-	_sprite.flip_h = false  # Phase 10: facing is done by scale.x (smooth flip), not flip_h
-	_sprite.scale = Vector2(0.5, 0.5)
 	_sprite.texture = _anim_idle[0]
-	if _rim != null:
-		_rim.texture = _anim_idle[0]
-		_rim.position = _sprite.position
-		_rim.scale = _sprite.scale * 1.07
-		_rim.visible = not dead
-	if _slash != null:
-		_slash.visible = false
+	if rig != null:
+		rig.call("set_class", id)
+		rig.call("set_tool", tool)
 	print("DEEPFALL_CLASS_SET id=%s name=%s hp=%d melee=%d speed=%.2f ranged=%s" % [
 		class_id, class_display_name, max_hp, melee_dmg, speed_mult, str(ranged)])
 
 func set_tool(t: String) -> void:
-	# Phase 10: main owns the tool state; this just mirrors it here.
 	tool = "sword" if t == "sword" else "pickaxe"
+	if rig != null:
+		rig.call("set_tool", tool)
+
+func set_aim(v: Vector2, held: bool) -> void:
+	aiming = held
+	if v.length() > 0.05:
+		aim = v.normalized()
+		if held and absf(aim.x) > 0.15:
+			facing = 1 if aim.x > 0.0 else -1
 
 func trigger_melee() -> void:
-	# Phase 10: plays the melee swing frames WITHOUT a strike — used
-	# for mining swings (pickaxe mining plays melee, not shoot).
+	# Mining swing (no damage call) toward the current aim.
 	if dead:
 		return
-	attack_timer = 0.55
-	_attack_struck = true  # no damage call: mining is not an attack
+	_swing_aim = aim if aiming else Vector2(facing, 0)
+	attack_timer = SWING_TIME
+	_attack_struck = true
+	_sfx("swing", 0.15, -6.0)
 
 func trigger_shoot() -> void:
-	_shoot_timer = 0.5  # 5 frames at 10 fps
+	_shoot_timer = 0.3
 
 func is_dead() -> bool:
 	return dead
 
 func try_attack() -> void:
-	# Public for the touch ATK button; desktop J calls this too.
-	# Phase 10: damage depends on the equipped tool. Sword = class
-	# melee (15/20/10) or the mage orb; pickaxe = weak 5-dmg swing.
+	try_attack_dir(aim if aiming else Vector2(facing, 0))
+
+func try_attack_dir(dir: Vector2) -> void:
 	if dead or attack_cooldown > 0.0:
 		return
+	if dir.length() < 0.05:
+		dir = Vector2(facing, 0)
+	dir = dir.normalized()
+	if absf(dir.x) > 0.15:
+		facing = 1 if dir.x > 0.0 else -1
+	_swing_aim = dir
 	if ranged and tool == "sword":
-		# Hooded mage: fires a short-range orb bolt (12 dmg, ~320px range)
-		# instead of swinging. Same J / ATK input and 0.55s cooldown as
-		# melee; the shoot animation plays. No new damage type system.
-		_shoot_timer = 0.5
-		attack_cooldown = 0.55
+		_shoot_timer = 0.3
+		attack_timer = SWING_TIME * 0.6
+		_attack_struck = true
+		attack_cooldown = 0.45
+		_sfx("dash", 0.1, -4.0)
 		if main_node != null and main_node.has_method("spawn_orb"):
-			main_node.call("spawn_orb", position, facing)
+			main_node.call("spawn_orb", position, facing, dir)
 		return
 	_strike_dmg = melee_dmg if tool == "sword" else 5
-	attack_timer = 0.55  # 4 frames at ~8 fps
-	attack_cooldown = 0.55
+	_sfx("swing", 0.12)
+	attack_timer = SWING_TIME
+	attack_cooldown = 0.42 if tool == "sword" else 0.5
 	_attack_struck = false
+
+func try_dash() -> void:
+	if dead or dash_cooldown > 0.0 or dash_timer > 0.0:
+		return
+	if not on_ground and _air_dash_used:
+		return
+	var dir := float(facing)
+	if absf(touch_move) > 0.2:
+		dir = signf(touch_move)
+	facing = int(dir)
+	dash_timer = DASH_TIME
+	dash_cooldown = DASH_COOLDOWN
+	if not on_ground:
+		_air_dash_used = true
+	vel = Vector2(dir * DASH_SPEED, 0.0)
+	hurt_timer = maxf(hurt_timer, DASH_TIME + 0.05)
+	_sfx("dash")
+	_fx_burst(position + Vector2(0, half_h - 4), Color(0.8, 0.8, 0.85), 10, 180.0)
+
+func try_slam() -> void:
+	if dead or slam_cooldown > 0.0 or slam_active:
+		return
+	slam_cooldown = SLAM_COOLDOWN
+	if on_ground:
+		# grounded: hop then dive, so the slam always has an impact
+		vel.y = -420.0
+		on_ground = false
+	slam_active = true
+	dash_timer = 0.0
+	_sfx("dash", 0.05, -3.0)
 
 func take_hit(dmg: int, from_x: float) -> void:
 	if dead or hurt_timer > 0.0:
 		return
 	hp -= dmg
-	hurt_timer = 0.5  # 0.5s invulnerability after a hit
-	vel.x = 220.0 if position.x >= from_x else -220.0
-	if on_ground:
-		vel.y = -150.0
+	hurt_timer = 0.6
+	var dir := 1.0 if position.x >= from_x else -1.0
+	vel.x = dir * 380.0
+	vel.y = -300.0
+	on_ground = false
+	_kb_timer = 0.25
+	dash_timer = 0.0
+	slam_active = false
+	if main_node != null:
+		var fx: Node = main_node.get("fx")
+		if fx != null:
+			fx.shake(9.0)
+			fx.hitstop(0.06)
+			fx.sfx("hurt")
+			fx.rumble(90)
+			fx.float_text(position + Vector2(0, -56), "-%d" % dmg, Color(1, 0.35, 0.3), true)
+			fx.burst(position, Color(0.9, 0.15, 0.2), 10, 260.0)
 	if hp <= 0:
 		hp = 0
 		dead = true
-		if _rim != null:
-			_rim.visible = false
-		if _slash != null:
-			_slash.visible = false
-		# Phase 9: dying now PLAYS instead of instantly hiding the sprite —
-		# the dying set (6 fps) runs for its full length, then the sprite
-		# hides. Main's 1.2 s respawn timer outlasts every dying set
-		# (tech 6f = 1.0 s, red 6f = 1.0 s, mage 5f = 0.83 s).
-		if _anim_dying.is_empty():
-			_sprite.visible = false
-		else:
+		if not _anim_dying.is_empty():
 			_dying_timer = float(_anim_dying.size()) / 6.0
-			_anim_time = 0.0
-			_sprite.texture = _anim_dying[0]
 		if main_node != null and main_node.has_method("player_died"):
 			main_node.call("player_died")
 
@@ -266,36 +315,39 @@ func respawn_at(spawn_pos: Vector2) -> void:
 	_double_jumped = false
 	_crouching = false
 	_drop_timer = 0.0
-	_sprite.visible = true
-	_sprite.modulate = Color(1, 1, 1, 1)
-	if _rim != null:
-		_rim.visible = true
-	if _slash != null:
-		_slash.visible = false
+	_kb_timer = 0.0
+	dash_timer = 0.0
+	slam_active = false
+	_sprite.visible = false
+
+func _sfx(n: String, pv := 0.08, db := 0.0) -> void:
+	if main_node != null and main_node.get("fx") != null:
+		main_node.fx.sfx(n, pv, db)
+
+func _fx_burst(pos: Vector2, col: Color, n: int, spd: float) -> void:
+	if main_node == null:
+		return
+	var fx: Node = main_node.get("fx")
+	if fx != null:
+		fx.burst(pos, col, n, spd, 900.0, 5.0, 0.45, 0.9)
 
 func _physics_process(delta: float) -> void:
 	if dead:
-		# Phase 9: dying animation plays out (see take_hit); the sprite
-		# hides only when the set finishes. Main respawns after 1.2 s.
 		if _dying_timer > 0.0:
 			_dying_timer = max(0.0, _dying_timer - delta)
-			_anim_time += delta
-			var total: float = float(_anim_dying.size()) / 6.0
-			var idx: int = mini(int((total - _dying_timer) * 6.0), _anim_dying.size() - 1)
-			_sprite.texture = _anim_dying[idx]
-			_sprite.flip_h = facing < 0
-			if _dying_timer <= 0.0:
-				_sprite.visible = false
+		_animate(delta, 0.0)
 		return
 	attack_cooldown = max(0.0, attack_cooldown - delta)
 	hurt_timer = max(0.0, hurt_timer - delta)
 	_drop_timer = max(0.0, _drop_timer - delta)
-	# Melee strike moment: attack_timer crossing ~0.3s remaining (frame 2).
+	_kb_timer = max(0.0, _kb_timer - delta)
+	dash_cooldown = max(0.0, dash_cooldown - delta)
+	slam_cooldown = max(0.0, slam_cooldown - delta)
 	if attack_timer > 0.0:
-		if not _attack_struck and attack_timer <= 0.3:
+		if not _attack_struck and attack_timer <= SWING_TIME * 0.55:
 			_attack_struck = true
 			if main_node != null and main_node.has_method("player_attack_hit"):
-				main_node.call("player_attack_hit", position, facing, _strike_dmg)
+				main_node.call("player_attack_hit", position, facing, _strike_dmg, _swing_aim)
 		attack_timer = max(0.0, attack_timer - delta)
 	if Input.is_key_pressed(KEY_J):
 		try_attack()
@@ -306,18 +358,43 @@ func _physics_process(delta: float) -> void:
 		move += 1.0
 	if touch_move != 0.0:
 		move = touch_move
-	# Phase 9: crouch = hold S / Down (desktop) or push the left stick down
-	# (touch) while on the ground. Visual only for the collision box, but
-	# movement is halved while crouched. Drop-through (below) takes
-	# priority when jump is pressed at the same time.
 	_crouching = on_ground and (Input.is_key_pressed(KEY_S) or Input.is_key_pressed(KEY_DOWN) or touch_crouch)
-	if move != 0.0:
+	if move != 0.0 and not aiming and attack_timer <= 0.0 and _kb_timer <= 0.0:
 		facing = 1 if move > 0.0 else -1
-	vel.x = move * SPEED * speed_mult * (0.5 if _crouching else 1.0)
-	vel.y += GRAVITY * delta
-	if vel.y > 1200.0:
-		vel.y = 1200.0
+	var target := move * SPEED * speed_mult * (0.5 if _crouching else 1.0)
 	var jump_down := Input.is_key_pressed(KEY_SPACE) or Input.is_key_pressed(KEY_W) or touch_jump
+	if dash_timer > 0.0:
+		dash_timer = max(0.0, dash_timer - delta)
+		vel.y = 0.0
+		if int(dash_timer * 60.0) % 2 == 0:
+			_fx_burst(position, Color(0.75, 0.85, 1.0), 2, 60.0)
+		if dash_timer <= 0.0:
+			vel.x *= 0.45
+	elif slam_active:
+		vel.x = move_toward(vel.x, 0.0, FRICTION * delta)
+		if vel.y < -60.0:
+			vel.y += GRAVITY * 2.0 * delta
+		else:
+			vel.y = SLAM_SPEED
+	else:
+		var accel := ACCEL_GROUND if on_ground else ACCEL_AIR
+		if _kb_timer > 0.0:
+			accel *= 0.2
+		if move != 0.0:
+			vel.x = move_toward(vel.x, target, accel * delta)
+		else:
+			vel.x = move_toward(vel.x, 0.0, (FRICTION if on_ground else ACCEL_AIR * 0.6) * (0.25 if _kb_timer > 0.0 else 1.0) * delta)
+		var g := GRAVITY
+		if vel.y > 0.0:
+			g *= FALL_MULT
+		elif jump_down and absf(vel.y) < 120.0:
+			g *= APEX_MULT
+		vel.y += g * delta
+		if not jump_down and vel.y < -200.0 and not _jump_cut_done and _kb_timer <= 0.0:
+			vel.y *= JUMP_CUT
+			_jump_cut_done = true
+	if vel.y > MAX_FALL and not slam_active:
+		vel.y = MAX_FALL
 	if (jump_down and not _prev_jump) or Input.is_action_just_pressed("ui_accept"):
 		buffer_timer = BUFFER
 	else:
@@ -327,11 +404,9 @@ func _physics_process(delta: float) -> void:
 		coyote_timer = COYOTE
 		jumps_left = 2
 		_double_jumped = false
+		_air_dash_used = false
 	else:
 		coyote_timer = max(0.0, coyote_timer - delta)
-	# Phase 9: drop through a one-way platform — S / Down + jump (desktop)
-	# or left-stick-down + jump (touch), while standing on a platform only.
-	# Solid ground is unaffected: that input jumps normally there.
 	var drop_down := Input.is_key_pressed(KEY_S) or Input.is_key_pressed(KEY_DOWN) or touch_drop
 	if buffer_timer > 0.0 and drop_down and on_ground and _standing_on_platform():
 		buffer_timer = 0.0
@@ -340,149 +415,76 @@ func _physics_process(delta: float) -> void:
 		on_ground = false
 		position.y += 4.0
 		vel.y = 60.0
-	elif buffer_timer > 0.0 and (on_ground or coyote_timer > 0.0 or jumps_left > 0):
-		# first jump from ground/coyote, second jump in air (double jump)
+	elif buffer_timer > 0.0 and not slam_active and (on_ground or coyote_timer > 0.0 or jumps_left > 0):
 		if on_ground or coyote_timer > 0.0:
 			jumps_left = 1
+			_fx_burst(position + Vector2(0, half_h - 4), Color(0.7, 0.66, 0.6), 8, 160.0)
 		else:
 			jumps_left -= 1
 			_double_jumped = true
+			_fx_burst(position + Vector2(0, half_h - 4), Color(0.6, 0.9, 1.0), 12, 220.0)
 		vel.y = JUMP_VEL
+		_sfx("jump", 0.05, 0.0 if not _double_jumped else 2.0)
+		dash_timer = 0.0
 		buffer_timer = 0.0
 		coyote_timer = 0.0
 		on_ground = false
-		_stretch_timer = 0.12  # Phase 10: stretch on jump takeoff
+		_jump_cut_done = false
+		_stretch_timer = 0.12
 	var was_ground := on_ground
-	_move_axis(delta, true)   # X
-	_move_axis(delta, false)  # Y
+	var fall_speed := vel.y
+	_move_axis(delta, true)
+	_move_axis(delta, false)
 	if on_ground and not was_ground and _was_airborne:
-		_land_timer = 0.15  # squash on landing; does not interrupt movement
+		_land_timer = 0.13
+		_jump_cut_done = false
+		_sfx("land", 0.1, -6.0 if fall_speed < 650.0 else 0.0)
+		if fall_speed > 650.0 or slam_active:
+			_fx_burst(position + Vector2(0, half_h - 4), Color(0.72, 0.68, 0.62), 14 if slam_active else 8, 240.0)
+		if slam_active:
+			slam_active = false
+			if main_node != null and main_node.has_method("slam_impact"):
+				main_node.call("slam_impact", position + Vector2(0, half_h))
+	if on_ground and absf(vel.x) > 160.0:
+		_dust_timer -= delta
+		if _dust_timer <= 0.0:
+			_dust_timer = 0.16
+			_fx_burst(position + Vector2(-facing * 10, half_h - 2), Color(0.62, 0.58, 0.52), 2, 70.0)
 	_was_airborne = not on_ground
-	_update_animation(delta, move)
+	_animate(delta, move)
 
-func _update_animation(delta: float, move: float) -> void:
+func _animate(delta: float, move: float) -> void:
 	_anim_time += delta
 	_shoot_timer = max(0.0, _shoot_timer - delta)
 	_land_timer = max(0.0, _land_timer - delta)
-	var frames: Array
-	var fps := 4.0
-	if attack_timer > 0.0:
-		# Melee overrides walk/idle/shoot while the swing plays.
-		# Same 0.5 scale / -8.75 offset as idle/walk: the melee canvas
-		# is also 195px tall, so it reads at the same size.
-		frames = _anim_melee; fps = 8.0
-	elif _shoot_timer > 0.0:
-		frames = _anim_shoot; fps = 10.0
-	elif _land_timer > 0.0:
-		# Land: the LOWEST crouch frame, consistently for all three classes.
-		# Tech has real fall frames, so its lowest fall frame is the land
-		# pose; red/mage have no fall frames, so their lowest crouch frame
-		# (last index of the set) is the land pose instead.
-		frames = [_anim_fall[_anim_fall.size() - 1]] if not _anim_fall.is_empty() else [_anim_crouch[_anim_crouch.size() - 1]]; fps = 1.0
-	elif _crouching and not _anim_crouch.is_empty():
-		# Phase 9: hold-down crouch while on the ground (S / Down, or the
-		# left stick pushed down on touch). Loops at 4 fps.
-		frames = _anim_crouch; fps = 4.0
-	elif not on_ground:
-		# Phase 9: thruster plays while airborne AFTER the double jump
-		# (all three classes have a thruster set now). Before the double
-		# jump, the old air poses still apply.
-		if _double_jumped and not _anim_thruster.is_empty():
-			frames = _anim_thruster; fps = 8.0
-		elif not _anim_fall.is_empty():
-			frames = [_anim_fall[1]] if vel.y > 0.0 else [_anim_fall[0]]; fps = 1.0
-		else:
-			frames = [_anim_thruster[0]]; fps = 1.0
-	elif move != 0.0:
-		frames = _anim_walkcycle; fps = 8.0
-	else:
-		frames = _anim_idle; fps = 4.0
-	# Phase 10 fluidity: the walk cycle is 4 frames at 8 fps, but the
-	# contact/lunge frames hold longer than the passing frames
-	# (durations 1.3 / 0.7 / 1.3 / 0.7 frame-units) so the stride reads
-	# weighted instead of metronomic, and a small vertical bob tied to
-	# the step cycle (±3 px, peaking on the passing frames) smooths the
-	# motion. No new frames are faked — this is playback shaping only.
-	var walking := move != 0.0 and on_ground and attack_timer <= 0.0 and _shoot_timer <= 0.0
-	var idx := 0
-	if frames == _anim_walkcycle and walking:
-		_walk_phase = fmod(_walk_phase + delta * 8.0, 4.0)
-		if _walk_phase < 1.3:
-			idx = 0
-		elif _walk_phase < 2.0:
-			idx = 1
-		elif _walk_phase < 3.3:
-			idx = 2
-		else:
-			idx = 3
-	else:
-		idx = int(_anim_time * fps) % frames.size()
-		if not walking:
-			_walk_phase = 0.0
-	if attack_timer > 0.0:
-		idx = min(int((0.55 - attack_timer) * 8.0), frames.size() - 1)
-	elif _shoot_timer > 0.0:
-		idx = min(int((0.5 - _shoot_timer) * 10.0), frames.size() - 1)
-	_sprite.texture = frames[idx]
-	# Hurt flicker: red-ish modulate during invulnerability, restored after.
-	if hurt_timer > 0.0:
-		_sprite.modulate = Color(1.0, 0.35, 0.35, 1.0)
-	else:
-		_sprite.modulate = Color(1, 1, 1, 1)
-	# Phase 10 scale: land squash (0.15 s), jump-takeoff stretch
-	# (0.12 s), idle breathing (2% at 2.2 rad/s). Feet stay anchored:
-	# the sprite origin is its centre and position.y is only moved by
-	# the walk bob, which is 0 on the contact frames.
 	_stretch_timer = max(0.0, _stretch_timer - delta)
-	var sx := 0.5
-	var sy := 0.5
-	if _land_timer > 0.0:
-		sx = 0.55
-		sy = 0.42
-	elif _stretch_timer > 0.0:
-		sx = 0.46
-		sy = 0.54
-	elif frames == _anim_idle:
-		sy = 0.5 * (1.0 + 0.02 * sin(_anim_time * 2.2))
-	# Smooth facing flip: scale.x lerps across 0 instead of snapping
-	# (flip_h is never used in the alive path). ~14/s reaches the new
-	# facing in ~0.1 s — a quick turn, not a freeze.
-	_sprite.scale.x = lerpf(_sprite.scale.x, float(facing) * sx, minf(1.0, 14.0 * delta))
-	_sprite.scale.y = sy
-	# Walk bob: 0 on contact frames (phase 0/2), -3 px on passing
-	# frames (phase 1/3). Idle keeps the base -8.75 offset exactly.
-	if walking:
-		_sprite.position.y = -8.75 - 3.0 * absf(sin(_walk_phase * PI / 2.0))
-	else:
-		_sprite.position.y = -8.75
-	# Phase 10 rim: mirrors the sprite (same texture, 7% larger, warm,
-	# semi-transparent) so the dark figure reads on dark rock.
-	if _rim != null:
-		_rim.texture = _sprite.texture
-		_rim.scale = _sprite.scale * 1.07
-		_rim.position = _sprite.position
-		_rim.visible = not dead
-	# Phase 10 slash arc: sweeps -65°..+65° with the swing and fades,
-	# so the blue slash reads attached to the character. Only during a
-	# melee swing (attack_timer); the mage orb path never sets it.
-	if _slash != null:
-		if attack_timer > 0.0:
-			var prog := (0.55 - attack_timer) / 0.55
-			_slash.visible = true
-			_slash.rotation = lerpf(-1.15, 1.15, prog)
-			_slash.scale = Vector2(float(facing), 1.0)
-			_slash.position = Vector2(float(facing) * 8.0, -20.0)
-			_slash.color = Color(0.65, 0.85, 1.0, 0.85 * (1.0 - 0.6 * prog))
-		else:
-			_slash.visible = false
-	# camera lookahead: ~1 tile in facing direction, smoothed by Camera2D
+	if rig == null:
+		return
+	rig.facing = facing
+	var swing := -1.0
+	if attack_timer > 0.0:
+		swing = clampf(1.0 - attack_timer / SWING_TIME, 0.0, 1.0)
+	rig.call("animate", {
+		"delta": delta, "vel": vel, "on_ground": on_ground, "move": move,
+		"crouch": _crouching, "swing": swing,
+		"aim": _swing_aim if attack_timer > 0.0 else aim, "aiming": aiming,
+		"dash": dash_timer > 0.0 or slam_active, "hurt": hurt_timer > 0.0 and dash_timer <= 0.0,
+		"dead": dead, "land": _land_timer, "stretch": _stretch_timer,
+		"speed_max": SPEED * speed_mult})
 	var cam: Camera2D = get_node_or_null("Camera2D")
 	if cam != null:
-		cam.offset = cam.offset.lerp(Vector2(facing * 32.0, 0.0), 1.0 - exp(-5.0 * delta))
+		var look := Vector2(facing * 40.0, clampf(vel.y * 0.04, -20.0, 40.0))
+		if aiming:
+			look += aim * 60.0
+		var shake := Vector2.ZERO
+		if main_node != null and main_node.get("fx") != null:
+			shake = main_node.fx.shake_vec
+		_cam_look = _cam_look.lerp(look, 1.0 - exp(-4.0 * delta))
+		cam.offset = _cam_look + shake
 
 func _solid(cx: int, cy: int) -> bool:
 	if cx < 0 or cx >= 80 or cy < 0 or cy >= 45:
-		return true  # world border is solid
+		return true
 	var t: int = fg[cy][cx]
 	return t != 0 and t != 7
 
@@ -492,15 +494,23 @@ func _platform(cx: int, cy: int) -> bool:
 	return fg[cy][cx] == 7
 
 func _standing_on_platform() -> bool:
-	# True when the cell directly under the player's feet is a one-way
-	# platform (id 7) and not solid ground. Used for drop-through.
 	var cx := int(floor(position.x / TILE))
 	var cy := int(floor((position.y + half_h + 1.0) / TILE))
 	return _platform(cx, cy)
 
+func _props() -> Array:
+	if main_node == null:
+		return []
+	var p = main_node.get("phys_props")
+	return p if p is Array else []
+
+func _my_rect() -> Rect2:
+	return Rect2(position - Vector2(half_w, half_h), Vector2(half_w * 2.0, half_h * 2.0))
+
 func _move_axis(delta: float, x_axis: bool) -> void:
 	if x_axis:
-		position.x += vel.x * delta
+		var dx := vel.x * delta
+		position.x += dx
 		var top := int(floor((position.y - half_h) / TILE))
 		var bot := int(floor((position.y + half_h - 1) / TILE))
 		if vel.x > 0:
@@ -517,8 +527,31 @@ func _move_axis(delta: float, x_axis: bool) -> void:
 					position.x = (cx + 1) * TILE + half_w + 0.01
 					vel.x = 0.0
 					break
+		# props: push the pushable ones (when grounded), then resolve
+		for pr in _props():
+			if not is_instance_valid(pr) or pr.broken:
+				continue
+			var r: Rect2 = pr.rect()
+			var me := _my_rect()
+			if not me.intersects(r) or me.end.y <= r.position.y + 6.0:
+				continue
+			if dx > 0.0 and position.x < r.get_center().x:
+				var overlap := me.end.x - r.position.x
+				if on_ground:
+					pr.push(overlap * 0.85)
+				r = pr.rect()
+				position.x = minf(position.x, r.position.x - half_w - 0.01)
+				vel.x = minf(vel.x, 150.0 * speed_mult) if on_ground else 0.0
+			elif dx < 0.0 and position.x > r.get_center().x:
+				var overlap2 := r.end.x - me.position.x
+				if on_ground:
+					pr.push(-overlap2 * 0.85)
+				r = pr.rect()
+				position.x = maxf(position.x, r.end.x + half_w + 0.01)
+				vel.x = maxf(vel.x, -150.0 * speed_mult) if on_ground else 0.0
 	else:
 		var prev_feet := position.y + half_h
+		var prev_head := position.y - half_h
 		position.y += vel.y * delta
 		var left := int(floor((position.x - half_w + 1) / TILE))
 		var right := int(floor((position.x + half_w - 1) / TILE))
@@ -526,8 +559,6 @@ func _move_axis(delta: float, x_axis: bool) -> void:
 		if vel.y > 0:
 			var cy := int(floor((position.y + half_h) / TILE))
 			for cx in range(left, right + 1):
-				# Phase 9: while _drop_timer runs (drop-through), one-way
-				# platforms are ignored entirely — the player falls past.
 				if _solid(cx, cy) or (_drop_timer <= 0.0 and _platform(cx, cy) and prev_feet <= cy * TILE + 1):
 					position.y = cy * TILE - half_h - 0.01
 					vel.y = 0.0
@@ -540,6 +571,19 @@ func _move_axis(delta: float, x_axis: bool) -> void:
 					position.y = (cy + 1) * TILE + half_h + 0.01
 					vel.y = 0.0
 					break
+		for pr in _props():
+			if not is_instance_valid(pr) or pr.broken:
+				continue
+			var r: Rect2 = pr.rect()
+			if not _my_rect().intersects(r):
+				continue
+			if vel.y >= 0.0 and prev_feet <= r.position.y + 2.0:
+				position.y = r.position.y - half_h - 0.01
+				vel.y = 0.0
+				on_ground = true
+			elif vel.y < 0.0 and prev_head >= r.end.y - 2.0:
+				position.y = r.end.y + half_h + 0.01
+				vel.y = 0.0
 
 func cell() -> Vector2i:
 	return Vector2i(int(floor(position.x / TILE)), int(floor(position.y / TILE)))

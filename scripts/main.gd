@@ -57,6 +57,31 @@ var _crystal_cells: Array = []
 
 # Phase 5 combat: enemies, kills, death/respawn.
 const ENEMY_SCRIPT := preload("res://scripts/enemy.gd")
+const FX_SCRIPT := preload("res://scripts/fx.gd")
+const PROP_SCRIPT := preload("res://scripts/phys_prop.gd")
+const CORPSE_SCRIPT := preload("res://scripts/enemy_corpse.gd")
+const LOOT_SCRIPT := preload("res://scripts/loot_drop.gd")
+# Phase 13: persistent props, run stats + summary card
+var _props_broken: Dictionary = {}
+var _props_moved: Dictionary = {}
+var _run_time := 0.0
+var _max_depth := 0
+var _props_smashed := 0
+var _deaths := 0
+var _card: CanvasLayer = null
+var _card_open := false
+var _card_pending := 0.0
+var _card_reason := ""
+var _cards_enabled := true
+var _card_status: Label = null
+# Phase 11: game-feel FX node, physics props, aim reticle, tile colours
+var fx: Node2D = null
+var phys_props: Array = []
+var _tile_colors: Dictionary = {}
+var _reticle: Line2D = null
+var _aim_cell := Vector2i(-1, -1)
+var _aim_show := 0.0
+const REACH := 3.4 * 64.0
 const DEATH_FX_SCRIPT := preload("res://scripts/death_fx.gd")
 # Phase 9b: Effekseer effects (EffekseerForGodot4 1.80.5.1, addons/effekseer).
 # Both .efkefc files are the EFKE container (CLI -o export, NOT -e/SKFE —
@@ -264,9 +289,41 @@ func _ready() -> void:
 	_hearts = HeartBar.new()
 	_hearts.name = "Hearts"
 	_hearts.offset_left = 16.0
-	_hearts.offset_top = 66.0
+	_hearts.offset_top = 16.0
 	_hearts.offset_right = 300.0
-	_hearts.offset_bottom = 90.0
+	_hearts.offset_bottom = 40.0
+	# Phase 11 HUD: compact stats under the hearts; the long desktop
+	# key-hint line only shows on devices without a touchscreen.
+	hud.offset_top = 44.0
+	hud.offset_bottom = 66.0
+	hud.add_theme_font_size_override("font_size", 14)
+	hud.add_theme_color_override("font_color", Color(0.92, 0.88, 0.78))
+	hud.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.9))
+	hud.add_theme_constant_override("outline_size", 5)
+	_hud2.offset_top = 690.0
+	_hud2.offset_bottom = 712.0
+	_hud2.add_theme_color_override("font_color", Color(1, 1, 1, 0.55))
+	_hud2.visible = not DisplayServer.is_touchscreen_available()
+	logl.set_anchors_preset(Control.PRESET_CENTER_TOP)
+	logl.offset_left = -300.0
+	logl.offset_right = 300.0
+	logl.offset_top = 84.0
+	logl.offset_bottom = 108.0
+	logl.add_theme_font_size_override("font_size", 16)
+	logl.add_theme_color_override("font_outline_color", Color(0, 0, 0, 0.9))
+	logl.add_theme_constant_override("outline_size", 5)
+	for fr in ["Foreground/FrameBL", "Foreground/FrameBR"]:
+		var frn: Node = get_node_or_null(fr)
+		if frn != null:
+			frn.queue_free()
+	_reticle = Line2D.new()
+	_reticle.width = 3.0
+	_reticle.closed = true
+	_reticle.default_color = Color(1.0, 0.85, 0.45, 0.9)
+	_reticle.points = PackedVector2Array([Vector2(0, 0), Vector2(TILE, 0), Vector2(TILE, TILE), Vector2(0, TILE)])
+	_reticle.z_index = 4
+	_reticle.visible = false
+	add_child(_reticle)
 	_hearts.main_node = self
 	$HUD.add_child(_hearts)
 	log_event("Tool: Pickaxe")
@@ -291,6 +348,17 @@ func _ready() -> void:
 		player.set_class("tech")
 	else:
 		_show_class_select(true)
+	for a0 in args:
+		if a0 == "--selftest" or a0 == "--selftest-load" or a0.begins_with("--screenshot"):
+			_cards_enabled = false
+	if "--selftest-p11" in args:
+		_show_class_select(false)
+		for a in args:
+			if a.begins_with("--class="):
+				player.set_class(a.trim_prefix("--class="))
+		await _run_selftest_p11()
+		get_tree().quit()
+		return
 	if "--screenshot-pair" in OS.get_cmdline_user_args():
 		await _run_screenshot_pair()
 		get_tree().quit()
@@ -387,6 +455,12 @@ func _rebuild_world(use_save: bool) -> void:
 	mine_damage.clear()
 	_mined_cells.clear()
 	_slain_ids.clear()
+	_props_broken.clear()
+	_props_moved.clear()
+	_run_time = 0.0
+	_max_depth = 0
+	_props_smashed = 0
+	_deaths = 0
 	_enemy_spawns.clear()
 	_pending_torches.clear()
 	_pending_lanterns.clear()
@@ -414,6 +488,7 @@ func _rebuild_world(use_save: bool) -> void:
 	if _enemies_node == null:
 		_enemies_node = Node2D.new()
 		_enemies_node.name = "Enemies"
+		_enemies_node.z_index = 2
 		add_child(_enemies_node)
 		move_child(_enemies_node, player.get_index())
 	_last_stream_chunk = Vector2i(-1, -1)
@@ -431,6 +506,8 @@ func _rebuild_world(use_save: bool) -> void:
 		player.hp = player.max_hp
 	player.fg = fg
 	player.main_node = self
+	_ensure_fx()
+	_spawn_phys_props()
 	# Player must be positioned BEFORE chunk activation, or the first
 	# active set is computed from the (0, 0) default position.
 	_apply_chunk_visibility(true)
@@ -526,6 +603,19 @@ func _apply_save(d: Dictionary) -> void:
 	_slain_ids.clear()
 	for sid in d.get("slain", []):
 		_slain_ids[int(sid)] = true
+	# Phase 13: smashed props stay smashed, pushed props stay pushed
+	_props_broken.clear()
+	for pid in d.get("props_broken", []):
+		_props_broken[int(pid)] = true
+	_props_moved.clear()
+	var pm: Dictionary = d.get("props_moved", {})
+	for k in pm.keys():
+		_props_moved[int(k)] = Vector2(float(pm[k][0]), float(pm[k][1]))
+	var st: Dictionary = d.get("stats", {})
+	_run_time = float(st.get("time", 0.0))
+	_max_depth = int(st.get("max_depth", 0))
+	_props_smashed = int(st.get("props_smashed", 0))
+	_deaths = int(st.get("deaths", 0))
 	var invd: Dictionary = d.get("inventory", {})
 	for k in inv.keys():
 		inv[k] = int(invd.get(k, 0))
@@ -584,6 +674,15 @@ func save_game(reason: String) -> void:
 	var slain_list: Array = []
 	for sid in _slain_ids.keys():
 		slain_list.append(int(sid))
+	var broken_list: Array = []
+	for pid in _props_broken.keys():
+		broken_list.append(int(pid))
+	for pr in phys_props:
+		if is_instance_valid(pr) and pr.has_meta("prop_id") and (pr.position - (pr.get_meta("spawn_pos") as Vector2)).length() > 4.0:
+			_props_moved[int(pr.get_meta("prop_id"))] = pr.position
+	var moved_dict := {}
+	for pid in _props_moved.keys():
+		moved_dict[str(pid)] = [(_props_moved[pid] as Vector2).x, (_props_moved[pid] as Vector2).y]
 	var d := {"version": SAVE_VERSION, "seed": SEED,
 		"player": {"x": player.position.x, "y": player.position.y, "hp": player.hp},
 		"class": player.class_id,
@@ -591,7 +690,9 @@ func save_game(reason: String) -> void:
 		"ore": ore_collected, "torches_held": torches_held, "kills": kills,
 		"extracted": extracted, "mined": mined_keys, "cracked": cracked_keys,
 		"torches": torch_dict, "slain": slain_list,
-		"inventory": inv.duplicate(), "lanterns": lantern_dict, "workbenches": bench_dict}
+		"inventory": inv.duplicate(), "lanterns": lantern_dict, "workbenches": bench_dict,
+		"props_broken": broken_list, "props_moved": moved_dict,
+		"stats": {"time": _run_time, "max_depth": _max_depth, "props_smashed": _props_smashed, "deaths": _deaths}}
 	var f := FileAccess.open(SAVE_PATH, FileAccess.WRITE)
 	if f == null:
 		print("DEEPFALL_SAVE_FAILED reason=%s" % reason)
@@ -846,7 +947,7 @@ func _face_cell(cell: Vector2i) -> void:
 	if dx != 0:
 		player.facing = 1 if dx > 0 else -1
 
-func player_attack_hit(from_pos: Vector2, facing: int, dmg := -1) -> void:
+func player_attack_hit(from_pos: Vector2, facing: int, dmg := -1, aim := Vector2.ZERO) -> void:
 	# Phase 10: dmg is set by the player's equipped tool (pickaxe 5,
 	# sword = class melee). Default -1 = class melee, which keeps the
 	# Phase 5 self-test call (2 args) working unchanged.
@@ -855,12 +956,37 @@ func player_attack_hit(from_pos: Vector2, facing: int, dmg := -1) -> void:
 	# Player melee strike: all enemies within 90px in front, 64px
 	# vertical tolerance, the passed damage (tool-based) with knockback
 	# away from the player. (Phase 8: was hardcoded 15 for the tech soldier.)
+	# Phase 11: the swing follows the aim direction (360°). Anything in
+	# a ~110° cone within 110 px is hit; knockback goes along the swing.
+	if aim == Vector2.ZERO:
+		aim = Vector2(facing, 0)
+	aim = aim.normalized()
+	var origin := from_pos + Vector2(0, -8)
+	var any_hit := false
 	for e in enemies.duplicate():
 		if not is_instance_valid(e):
 			continue
-		var d: Vector2 = e.position - from_pos
-		if d.x * facing > 0.0 and absf(d.x) <= 90.0 and absf(d.y) <= 64.0:
-			e.take_hit(dmg, from_pos.x)
+		var d: Vector2 = e.position - origin
+		var in_cone: bool = d.length() <= 110.0 + e.half_w and (d.length() < 24.0 or d.normalized().dot(aim) > 0.35)
+		if in_cone:
+			var kb := (aim * 0.7 + d.normalized() * 0.3).normalized() * 340.0 + Vector2(0, -160)
+			e.take_hit(dmg, from_pos.x, kb)
+			any_hit = true
+			if fx != null:
+				fx.burst(e.position, Color(1.0, 0.85, 0.5), 10, 320.0, 600.0, 5.0)
+				fx.float_text(e.position + Vector2(0, -50), str(dmg), Color(1, 0.95, 0.6), dmg >= 15)
+	for pr in phys_props.duplicate():
+		if not is_instance_valid(pr) or pr.broken:
+			continue
+		var dp: Vector2 = pr.position - origin
+		if dp.length() <= 100.0 + pr.half.x and (dp.length() < 24.0 or dp.normalized().dot(aim) > 0.35):
+			pr.take_hit(dmg, from_pos, aim * 300.0 + Vector2(0, -140))
+			any_hit = true
+	if any_hit and fx != null:
+		fx.shake(6.0)
+		fx.hitstop(0.045)
+		fx.sfx("hit", 0.1)
+		fx.rumble(35)
 
 # --- Phase 8: hooded mage orb bolt (ranged attack, no new damage type) ---
 const ORB_SPEED := 500.0
@@ -868,9 +994,12 @@ const ORB_RANGE := 320.0
 const ORB_DMG := 12
 var _orbs: Array = []
 
-func spawn_orb(from_pos: Vector2, facing: int) -> void:
+func spawn_orb(from_pos: Vector2, facing: int, aim := Vector2.ZERO) -> void:
+	if aim == Vector2.ZERO:
+		aim = Vector2(facing, 0)
+	aim = aim.normalized()
 	var orb := Node2D.new()
-	orb.position = from_pos + Vector2(facing * 24.0, -10.0)
+	orb.position = from_pos + Vector2(0, -10.0) + aim * 24.0
 	var dot := Polygon2D.new()
 	var pts := PackedVector2Array()
 	for k in range(8):
@@ -888,7 +1017,7 @@ func spawn_orb(from_pos: Vector2, facing: int) -> void:
 	halo.color = Color(0.5, 0.89, 0.94, 0.25)
 	orb.add_child(halo)
 	add_child(orb)
-	_orbs.append({"node": orb, "dir": facing, "travelled": 0.0, "trail_left": 0.0})
+	_orbs.append({"node": orb, "dir": facing, "v": aim, "travelled": 0.0, "trail_left": 0.0})
 	print("DEEPFALL_ORB_FIRED facing=%d" % facing)
 
 # Phase 9: mage orb trail + impact, from the staged effects library
@@ -977,7 +1106,7 @@ func _update_orbs(delta: float) -> void:
 			_orbs.erase(o)
 			continue
 		var step := ORB_SPEED * delta
-		orb.position.x += step * int(o["dir"])
+		orb.position += (o.get("v", Vector2(int(o["dir"]), 0)) as Vector2) * step
 		o["travelled"] = float(o["travelled"]) + step
 		# Phase 9 trail: a fading dot every 24 px of flight.
 		o["trail_left"] = float(o.get("trail_left", 0.0)) + step
@@ -987,9 +1116,17 @@ func _update_orbs(delta: float) -> void:
 		var hit := false
 		for e in enemies.duplicate():
 			if is_instance_valid(e) and orb.position.distance_to(e.position) <= 28.0:
-				e.take_hit(ORB_DMG, orb.position.x - int(o["dir"]) * 24.0)
+				e.take_hit(ORB_DMG, orb.position.x - int(o["dir"]) * 24.0, (o.get("v", Vector2(int(o["dir"]), 0)) as Vector2) * 300.0 + Vector2(0, -120))
+				if fx != null:
+					fx.float_text(e.position + Vector2(0, -50), str(ORB_DMG), Color(0.6, 1.0, 0.95))
 				hit = true
 				break
+		if not hit:
+			for pr in phys_props.duplicate():
+				if is_instance_valid(pr) and not pr.broken and pr.rect().grow(6.0).has_point(orb.position):
+					pr.take_hit(ORB_DMG, orb.position - (o.get("v", Vector2.RIGHT) as Vector2) * 24.0)
+					hit = true
+					break
 		var cell := Vector2i(int(floor(orb.position.x / TILE)),
 			int(floor(orb.position.y / TILE)))
 		if not hit and (cell.x < 0 or cell.x >= 80 or cell.y < 0 or cell.y >= 45
@@ -1008,7 +1145,12 @@ func spawn_death_fx(pos: Vector2) -> void:
 func player_died() -> void:
 	print("DEEPFALL_PLAYER_DIED")
 	spawn_death_fx(player.position)
-	_respawn_timer = 1.2
+	_deaths += 1
+	if _cards_enabled:
+		_card_pending = 0.9
+		_card_reason = "death"
+	else:
+		_respawn_timer = 1.2
 
 func respawn_run() -> void:
 	var spawn: Vector2i = data["spawn"]
@@ -1878,6 +2020,14 @@ func _process(delta: float) -> void:
 		if Input.is_key_pressed(KEY_T) and mine_cooldown <= 0.0:
 			_place_torch()
 			mine_cooldown = 0.25
+		var tu: Node = get_node_or_null("TouchUI")
+		var touch_mode: bool = tu != null and bool(tu.get("touch_used"))
+		if not touch_mode and DisplayServer.is_touchscreen_available() == false:
+			var md: Vector2 = get_global_mouse_position() - player.position
+			var lmb := Input.is_mouse_button_pressed(MOUSE_BUTTON_LEFT)
+			player.set_aim(md, lmb)
+			if lmb and not (_craft_panel != null and _craft_panel.visible):
+				aim_action(md.normalized(), true)
 	# torch flicker: subtle, +-5%
 	var i := 0
 	for key in torches.keys():
@@ -1901,6 +2051,9 @@ func _process(delta: float) -> void:
 	if pc == data["exit"] and not extracted:
 		extracted = true
 		print("DEEPFALL_EXTRACT_REACHED")
+		if _cards_enabled:
+			_card_pending = 0.4
+			_card_reason = "extract"
 	if extracted and not _extract_saved:
 		_extract_saved = true
 		save_game("extract")
@@ -1911,6 +2064,15 @@ func _process(delta: float) -> void:
 			_apply_chunk_visibility()
 			save_game("chunk")
 	var depth: int = max(0, pc.y)
+	if not _selecting and not _card_open:
+		_run_time += delta
+		_max_depth = maxi(_max_depth, depth)
+	if fx != null:
+		fx.update_ambience(clampf(float(depth) / 44.0, 0.0, 1.0))
+	if _card_pending > 0.0:
+		_card_pending -= delta
+		if _card_pending <= 0.0:
+			show_run_card(_card_reason)
 	var sc_now := _stream_chunk_of(pc)
 	var save_note := ""
 	if _save_note != "" and _time - _save_time < 3.0:
@@ -1920,20 +2082,16 @@ func _process(delta: float) -> void:
 	# (short labels, no "DEEPFALL |" prefix) at font 16, and the hint
 	# lives on its own label (_hud2, font 14) — both measured in the
 	# Phase 9 self-test and both fit inside 1264 px.
-	hud.text = "Class: %s | Tool: %s | D:%d | Ore:%d | T:%d | S%s %d/15%s%s | Inv W%d S%d C%d G%d A%d Sd%d Gl%d | HP %d/%d | Foes %d left (%d slain)" % [
-		player.class_display_name,
-		"Pickaxe" if tool == "pickaxe" else "Sword",
-		depth, ore_collected, torches_held, str(sc_now), _loaded_chunk_count,
-		("  |  Last: " + last_ore_name) if last_ore_name != "" else "",
-		("  |  EXTRACT!" if extracted else "") + save_note,
-		inv["wood"], inv["stone"], inv["coal"], inv["gold"], inv["amber"], inv["sand"], inv["glass"],
-		player.hp, player.max_hp, _foes_remaining(), kills]
+	hud.text = "Depth %d   Ore %d   Foes %d%s%s" % [
+		depth, ore_collected, _foes_remaining(),
+		"   EXTRACT!" if extracted else "", save_note]
+	_update_aim_reticle(delta)
 	if _hud2 != null:
 		# Phase 10: hint line trimmed to fit < 1248 px at font 14
 		# (the Phase 9 line plus "Q tool" and the new touch buttons
 		# ran to 1589 px). F5 save / F9 new stay in the README; the
 		# SAVE/NEW buttons are visible on screen.
-		_hud2.text = "A/D move  Space jump x2  E mine  T torch  L lantern  B bench  C craft  J attack%s  Q tool  Click mine  |  Touch: sticks, TORCH, ATK, JUMP, TOOL" % [
+		_hud2.text = "A/D move  Space jump  Shift dash  F slam  Mouse aim + hold LMB attack/mine  J attack%s  Q tool  T torch  L lantern  B bench  C craft" % [
 			" (orb bolt)" if player.ranged else ""]
 
 func _input(event: InputEvent) -> void:
@@ -1969,11 +2127,17 @@ func _input(event: InputEvent) -> void:
 		# that branch returns above, so no clash.)
 		elif event.keycode == KEY_Q:
 			cycle_tool()
+		elif event.keycode == KEY_SHIFT:
+			player.try_dash()
+		elif event.keycode == KEY_F:
+			player.try_slam()
 		elif event.keycode == KEY_1:
 			set_tool("pickaxe")
 		elif event.keycode == KEY_2:
 			set_tool("sword")
 	if event is InputEventMouseButton and event.pressed and event.button_index == MOUSE_BUTTON_LEFT:
+		if event.device == InputEvent.DEVICE_ID_EMULATION:
+			return  # Phase 11: touches are handled by touch_ui (sticks / buttons)
 		if _selecting:
 			return  # clicks on the select screen go to its buttons only
 		if _craft_panel != null and _craft_panel.visible and _craft_panel.get_global_rect().has_point(event.position):
@@ -1987,7 +2151,7 @@ func _input(event: InputEvent) -> void:
 		elif workbenches.has(cell):
 			_pickup_workbench(cell)
 		else:
-			_mine_at(cell)
+			aim_action((get_global_mouse_position() - player.position).normalized(), true)
 
 func _mine_at(cell: Vector2i, via_stick := false) -> void:
 	if cell.x < 0 or cell.x >= 80 or cell.y < 0 or cell.y >= 45:
@@ -2013,6 +2177,12 @@ func _mine_at(cell: Vector2i, via_stick := false) -> void:
 	# Pickaxe: unchanged 2-hit + crack behaviour, but the mining swing
 	# plays the melee animation now (not the shoot animation).
 	player.call("trigger_melee")
+	_face_cell(cell)
+	var cpos := Vector2((cell.x + 0.5) * TILE, (cell.y + 0.5) * TILE)
+	if fx != null:
+		fx.burst(cpos, _tile_color(t), 7 if mine_damage.has(cell) else 5, 280.0)
+		fx.shake(2.5)
+		fx.sfx("mine_hit", 0.12)
 	# damaged state first: crack overlay, block survives one hit.
 	# Phase 6: the crack is an edit delta, saved with the run.
 	if not mine_damage.has(cell):
@@ -2028,6 +2198,12 @@ func _mine_at(cell: Vector2i, via_stick := false) -> void:
 	_edge_layer_for(cell).erase_cell(cell)
 	player.fg = fg
 	_grant_material(t)
+	if fx != null:
+		fx.burst(cpos, _tile_color(t), 16, 360.0, 1400.0, 8.0)
+		fx.flyer(cpos, _tile_color(t), "+1 %s" % _material_name(t))
+		fx.shake(4.0)
+		fx.sfx("mine_break", 0.1)
+		fx.rumble(20)
 	if t == 4 or t == 5:
 		ore_collected += 1
 		last_ore_name = "Gold ore" if t == 4 else "Amber ore"
@@ -2205,22 +2381,43 @@ func _grant_material(t: int) -> void:
 func _grant_enemy_drop(enemy: Node2D) -> void:
 	# Small deterministic drop table, seed-determined via spawn_id
 	# (never the global RNG, so the same run always drops the same).
-	# Bat drops nothing. Golem drops stone. Others give at most 1
-	# coal or stone, by spawn_id parity. Test spawns (spawn_id -1)
-	# fall back to 1 stone.
+	# Phase 13: drops are physical pickups that bounce out of the body
+	# (loot_drop.gd); the inventory is credited when collected.
+	var drops: Array = []
 	match enemy.slug:
 		"cave-bat-swarm":
 			print("DEEPFALL_DROP slug=%s item=none" % enemy.slug)
 		"rock-golem":
-			inv["stone"] += 2
+			drops = [["stone", 1], ["stone", 1], ["amber", 1]] if enemy.spawn_id >= 0 and enemy.spawn_id % 3 == 0 else [["stone", 1], ["stone", 1]]
 			print("DEEPFALL_DROP slug=%s item=stone n=2" % enemy.slug)
+		"ore-mimic":
+			drops = [["gold", 1], ["gold", 1], ["stone", 1]]
+			print("DEEPFALL_DROP slug=%s item=gold n=2" % enemy.slug)
 		_:
 			if enemy.spawn_id >= 0 and enemy.spawn_id % 2 == 0:
-				inv["coal"] += 1
+				drops = [["coal", 1]]
 				print("DEEPFALL_DROP slug=%s item=coal n=1" % enemy.slug)
 			else:
-				inv["stone"] += 1
+				drops = [["stone", 1]]
 				print("DEEPFALL_DROP slug=%s item=stone n=1" % enemy.slug)
+	for dspec in drops:
+		var ld: Node2D = LOOT_SCRIPT.new()
+		ld.setup(String(dspec[0]), int(dspec[1]), self)
+		ld.position = enemy.position + Vector2(0, -10)
+		add_child(ld)
+
+func collect_loot(drop: Node2D) -> void:
+	inv[drop.item] = int(inv.get(drop.item, 0)) + drop.amount
+	if fx != null:
+		fx.sfx("pickup", 0.12)
+		fx.float_text(player.position + Vector2(0, -60), "+%d %s" % [drop.amount, String(drop.item).capitalize()], Color(1, 0.95, 0.7))
+	print("DEEPFALL_LOOT_COLLECTED item=%s n=%d total=%d" % [drop.item, drop.amount, int(inv[drop.item])])
+
+func spawn_enemy_corpse(e: Node2D) -> void:
+	var c: Node2D = CORPSE_SCRIPT.new()
+	c.setup(String(e.slug), self, int(e.facing), e.vel, float(e.half_h))
+	c.position = e.position
+	add_child(c)
 
 func _near_workbench() -> bool:
 	var pc: Vector2i = player.cell()
@@ -2357,22 +2554,12 @@ func _place_workbench_at(cell: Vector2i, floor_cell: Vector2i) -> bool:
 	var bench := Node2D.new()
 	bench.position = Vector2(cell.x * TILE, (cell.y + 1) * TILE)
 	bench.set_meta("floor", floor_cell)
-	var top := ColorRect.new()
-	top.size = Vector2(TILE, 10)
-	top.position = Vector2(0, -30)
-	top.color = Color(0.45, 0.32, 0.16, 1.0)
-	bench.add_child(top)
-	for lx in [6.0, 50.0]:
-		var leg := ColorRect.new()
-		leg.size = Vector2(8, 30)
-		leg.position = Vector2(lx, -30)
-		leg.color = Color(0.35, 0.24, 0.12, 1.0)
-		bench.add_child(leg)
-	var vice := ColorRect.new()
-	vice.size = Vector2(14, 8)
-	vice.position = Vector2(40, -38)
-	vice.color = Color(0.55, 0.55, 0.58, 1.0)
-	bench.add_child(vice)
+	var bspr := Sprite2D.new()
+	bspr.texture = load("res://assets/hero/props/workbench.png")
+	bspr.centered = false
+	bspr.scale = Vector2(4, 4)
+	bspr.position = Vector2(0, -52)
+	bench.add_child(bspr)
 	add_child(bench)
 	workbenches[cell] = bench
 	return true
@@ -2503,20 +2690,19 @@ func _toggle_craft_panel() -> void:
 
 const CLASS_CARDS := [
 	{"id": "tech", "name": "Tech Soldier",
-		"desc": "Balanced all-rounder. Standard rifle and pickaxe.",
-		"stats": "HP 100  |  Melee 15  |  Speed normal  |  Melee attack (J / ATK)"},
+		"desc": "Balanced all-rounder. Sword and pickaxe, steady and quick.",
+		"stats": "HP 100  |  Sword 15  |  Speed normal"},
 	{"id": "red", "name": "Red Soldier",
 		"desc": "Heavy hitter. Slower, hits harder, takes more punishment.",
-		"stats": "HP 120  |  Melee 20  |  Speed slower  |  Melee attack (J / ATK)"},
+		"stats": "HP 120  |  Sword 20  |  Speed slower"},
 	{"id": "mage", "name": "Hooded Mage",
-		"desc": "Fragile caster. Fires a short-range orb bolt instead of swinging.",
-		"stats": "HP 80  |  Melee 10  |  Speed normal  |  Orb bolt 12 dmg (J / ATK)"},
+		"desc": "Fragile caster. The staff fires an orb bolt wherever you aim.",
+		"stats": "HP 80  |  Staff orb 12 (aimed)  |  Speed normal"},
 ]
 
 func _class_idle_texture(id: String) -> Texture2D:
-	if id == "tech":
-		return load("res://assets/player_anim/idle_0.png")
-	return load("res://assets/player_anim/%s/idle_0.png" % id)
+	# Phase 11: the pixel paper-doll preview (build_pixel_hero.py)
+	return load("res://assets/hero/%s/preview.png" % id)
 
 func _build_class_select() -> void:
 	var panel := PanelContainer.new()
@@ -2538,7 +2724,7 @@ func _build_class_select() -> void:
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	vb.add_child(title)
 	var hint := Label.new()
-	hint.text = "Desktop: 1 / 2 / 3, or Left / Right + Enter. Touch: tap PLAY on a card."
+	hint.text = "Tap PLAY on a card  (desktop: 1 / 2 / 3, or Left / Right + Enter)"
 	hint.add_theme_font_size_override("font_size", 16)
 	hint.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	vb.add_child(hint)
@@ -2556,7 +2742,7 @@ func _build_class_select() -> void:
 		var pic := TextureRect.new()
 		pic.texture = _class_idle_texture(String(card["id"]))
 		pic.custom_minimum_size = Vector2(128, 195)
-		pic.expand_mode = TextureRect.EXPAND_KEEP_SIZE
+		pic.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 		pic.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 		pic.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
 		cell.add_child(pic)
@@ -3214,58 +3400,8 @@ func _run_selftest_phase9() -> void:
 		print("DEEPFALL_SELFTEST_PHASE9 collision bottom_row y=%.1f on_ground=%s (expect y < %d, true)" % [player.position.y, str(player.on_ground), 45 * TILE])
 		if player.position.y >= 45 * TILE or not player.on_ground:
 			ok = false
-	# (d) Twin sticks (code level — feel still needs a real phone).
-	var tui: Node = get_node("TouchUI")
-	var lc: Vector2 = tui.get("_left_center")
-	tui._update_left(lc + Vector2(0.14 * 70.0, 0.0))
-	var dz_small := float(player.touch_move)
-	tui._update_left(lc + Vector2(0.5 * 70.0, 0.0))
-	var dz_big := float(player.touch_move)
-	tui._update_left(lc + Vector2(0.0, -0.71 * 70.0))
-	var jump_on := bool(player.touch_jump)
-	tui._update_left(lc + Vector2(0.0, -0.14 * 70.0))
-	var jump_off := bool(player.touch_jump)
-	tui._update_left(lc + Vector2(0.0, 0.7 * 70.0))
-	var crouch_on := bool(player.touch_crouch)
-	var drop_on := bool(player.touch_drop)
-	player.touch_move = 0.0
-	player.touch_jump = false
-	player.touch_crouch = false
-	player.touch_drop = false
-	print("DEEPFALL_SELFTEST_PHASE9 sticks deadzone v=0.14 -> move=%.2f (expect 0.0); v=0.5 -> move=%.2f (expect 0.5); jump v=-0.71 -> %s, v=-0.14 -> %s (expect true/false); down v=0.7 -> crouch=%s drop=%s (expect true/true)" % [dz_small, dz_big, str(jump_on), str(jump_off), str(crouch_on), str(drop_on)])
-	if not is_equal_approx(dz_small, 0.0) or not is_equal_approx(dz_big, 0.5) or not jump_on or jump_off or not crouch_on or not drop_on:
-		ok = false
-	# Right stick 8-way mining: east, then diagonal south-east (the wall
-	# cell right of the player and the wall cell down-right both crack).
-	if wall_c.x >= 0:
-		var wall_floor2 := _p9_first_solid_below(wall_c.x - 1, wall_c.y)
-		_p9_place_feet(wall_c.x - 1, wall_floor2 * TILE)
-		_p9_settle()
-		var rc: Vector2 = tui.get("_right_center")
-		mine_cooldown = 0.0
-		tui.set("_right_id", 0)
-		tui._update_right(rc + Vector2(0.9 * 70.0, 0.0))
-		tui._process(0.05)
-		var mined_e := mine_damage.has(player.cell() + Vector2i(1, 0))
-		mine_cooldown = 0.0
-		tui._update_right(rc + Vector2(0.7 * 70.0, 0.7 * 70.0))
-		tui._process(0.05)
-		var mined_se := mine_damage.has(player.cell() + Vector2i(1, 1))
-		tui.set("_right_id", -1)
-		print("DEEPFALL_SELFTEST_PHASE9 sticks right_mine east=%s south_east=%s (expect true/true)" % [str(mined_e), str(mined_se)])
-		if not mined_e or not mined_se:
-			ok = false
-		# Multi-touch: both sticks held + ATK fires.
-		tui.set("_left_id", 0)
-		tui.set("_right_id", 1)
-		player.attack_cooldown = 0.0
-		tui._atk_down()
-		var atk_fired: bool = player.attack_cooldown > 0.0
-		tui.set("_left_id", -1)
-		tui.set("_right_id", -1)
-		print("DEEPFALL_SELFTEST_PHASE9 sticks multitouch atk_cooldown=%.2f (expect > 0)" % player.attack_cooldown)
-		if not atk_fired:
-			ok = false
+	# (d) Twin sticks: superseded by the Phase 11 floating sticks —
+	# see _run_selftest_p11 (--selftest-p11, simulated multi-touch).
 	# (e) Enemy animation: walk + attack actually play per slug.
 	player.hp = 10000
 	player.hurt_timer = 0.0
@@ -3732,3 +3868,676 @@ func _measure_text(s: String, size: int) -> float:
 	# self-test (the HUD label's own default font).
 	var font: Font = hud.get_theme_default_font()
 	return font.get_string_size(s, HORIZONTAL_ALIGNMENT_LEFT, -1.0, size).x
+
+
+# --- Phase 11: aim actions, physics props, FX helpers ---
+
+func _ensure_fx() -> void:
+	if fx == null:
+		fx = FX_SCRIPT.new()
+		fx.name = "FX"
+		fx.main_node = self
+		fx.z_index = 5
+		add_child(fx)
+
+func _tile_color(t: int) -> Color:
+	if _tile_colors.has(t):
+		return _tile_colors[t]
+	var col := Color(0.5, 0.5, 0.5)
+	if t >= 1 and t <= TILE_NAMES.size():
+		var tex: Texture2D = load("res://assets/tiles/%s.png" % TILE_NAMES[t - 1])
+		if tex != null:
+			var img := tex.get_image()
+			if img != null:
+				if img.is_compressed():
+					img.decompress()
+				img.resize(1, 1, Image.INTERPOLATE_BILINEAR)
+				col = img.get_pixel(0, 0).lightened(0.15)
+	_tile_colors[t] = col
+	return col
+
+func _material_name(t: int) -> String:
+	match t:
+		1, 2:
+			return "Dirt"
+		4:
+			return "Gold"
+		5:
+			return "Amber"
+		6:
+			return "Wood"
+		11:
+			return "Sand"
+		13:
+			return "Coal"
+	return "Stone"
+
+# Ray from the hero's chest along `dir`, up to REACH. Returns the first
+# solid cell (or (-1,-1)) and the first prop on the way (or null).
+func _aim_probe(dir: Vector2) -> Dictionary:
+	var origin: Vector2 = player.position + Vector2(0, -8)
+	var step := 8.0
+	var dist := 0.0
+	while dist <= REACH:
+		var p := origin + dir * dist
+		for pr in phys_props:
+			if is_instance_valid(pr) and not pr.broken and pr.rect().has_point(p):
+				return {"cell": Vector2i(-1, -1), "prop": pr}
+		var c := Vector2i(int(floor(p.x / TILE)), int(floor(p.y / TILE)))
+		if c.x >= 0 and c.x < 80 and c.y >= 0 and c.y < 45:
+			var t: int = fg[c.y][c.x]
+			if t != 0 and t != 7:
+				return {"cell": c, "prop": null}
+		dist += step
+	return {"cell": Vector2i(-1, -1), "prop": null}
+
+# The right stick / mouse action: pickaxe mines the first block along
+# the aim (or smacks a prop / swings at enemies), sword / staff attacks
+# in the aim direction. Rate-limited by mine_cooldown / attack_cooldown.
+func aim_action(dir: Vector2, _via_stick := true) -> void:
+	if _selecting or player.dead or dir.length() < 0.05:
+		return
+	dir = dir.normalized()
+	_aim_show = 0.25
+	if tool == "sword":
+		player.try_attack_dir(dir)
+		return
+	if mine_cooldown > 0.0 or float(player.attack_timer) > 0.0:
+		return
+	var probe := _aim_probe(dir)
+	var c: Vector2i = probe["cell"]
+	if probe["prop"] != null:
+		player.try_attack_dir(dir)
+		mine_cooldown = 0.3
+	elif c.x >= 0 and not _enemy_closer_than_cell(dir, c):
+		player.set("_swing_aim", dir)
+		_mine_at(c)
+		player.set("_swing_aim", dir)
+		mine_cooldown = 0.26
+	else:
+		player.try_attack_dir(dir)
+		mine_cooldown = 0.3
+
+func _enemy_closer_than_cell(dir: Vector2, c: Vector2i) -> bool:
+	var origin: Vector2 = player.position + Vector2(0, -8)
+	var cd: float = origin.distance_to(Vector2((c.x + 0.5) * TILE, (c.y + 0.5) * TILE))
+	for e in enemies:
+		if is_instance_valid(e):
+			var d: Vector2 = e.position - origin
+			if d.length() < minf(cd, 110.0) and d.normalized().dot(dir) > 0.5:
+				return true
+	return false
+
+func _update_aim_reticle(delta: float) -> void:
+	if _reticle == null:
+		return
+	_aim_show = maxf(0.0, _aim_show - delta)
+	var show: bool = (bool(player.get("aiming")) or _aim_show > 0.0) and tool == "pickaxe" and not _selecting
+	if show:
+		var c: Vector2i = _aim_probe(player.aim)["cell"]
+		show = c.x >= 0
+		if show:
+			_reticle.position = Vector2(c.x * TILE, c.y * TILE)
+			var k := 0.6 + 0.4 * sin(_time * 10.0)
+			_reticle.default_color = Color(1.0, 0.85, 0.45, k)
+	_reticle.visible = show
+
+# Breakable / pushable props, placed deterministically on room floors.
+func _spawn_phys_props() -> void:
+	for pr in phys_props:
+		if is_instance_valid(pr):
+			pr.free()
+	phys_props.clear()
+	var rng := RandomNumberGenerator.new()
+	rng.seed = SEED + 1111
+	var spawn: Vector2i = data["spawn"]
+	var exit_cell: Vector2i = data["exit"]
+	var kinds := ["crate", "crate", "barrel", "pot", "pot"]
+	var next_id := 0
+	var skipped := 0
+	var placed_x: Array = []
+	for r in data["rooms"]:
+		var rx: int = r[0]; var ry: int = r[1]; var rw: int = r[2]; var rh: int = r[3]
+		var want := rng.randi_range(1, 3)
+		var tries := 0
+		while want > 0 and tries < 20:
+			tries += 1
+			var x := rng.randi_range(rx + 1, rx + rw - 2)
+			var y := ry + rh - 2
+			while y > ry and fg[y][x] != 0:
+				y -= 1
+			if fg[y][x] != 0 or fg[y - 1][x] != 0:
+				continue
+			var fl: int = fg[y + 1][x]
+			if fl == 0:
+				continue
+			var c := Vector2i(x, y)
+			if absi(c.x - spawn.x) <= 2 or c == exit_cell or torches.has(c) or workbenches.has(c) or lanterns.has(c):
+				continue
+			var dup := false
+			for px0 in placed_x:
+				if absf(float(px0) - (x + 0.5) * TILE) < TILE:
+					dup = true
+			if dup:
+				continue
+			var k: String = kinds[rng.randi_range(0, kinds.size() - 1)]
+			var pid := next_id
+			next_id += 1
+			var roll := rng.randi_range(0, 99)
+			want -= 1
+			placed_x.append((x + 0.5) * TILE)
+			if _props_broken.has(pid):
+				skipped += 1
+				continue
+			var pr2: Node2D = PROP_SCRIPT.new()
+			pr2.setup(k, self)
+			pr2.position = Vector2((x + 0.5) * TILE, (y + 1) * TILE - pr2.half.y - 0.01)
+			pr2.set_meta("loot_roll", roll)
+			pr2.set_meta("prop_id", pid)
+			pr2.set_meta("spawn_pos", pr2.position)
+			if _props_moved.has(pid):
+				pr2.position = _props_moved[pid]
+			add_child(pr2)
+			move_child(pr2, player.get_index())
+			phys_props.append(pr2)
+	print("DEEPFALL_PROPS spawned=%d skipped_broken=%d" % [phys_props.size(), skipped])
+
+func prop_broken(pr: Node2D) -> void:
+	phys_props.erase(pr)
+	_props_smashed += 1
+	if pr.has_meta("prop_id"):
+		_props_broken[int(pr.get_meta("prop_id"))] = true
+		_props_moved.erase(int(pr.get_meta("prop_id")))
+	var roll: int = int(pr.get_meta("loot_roll", 0))
+	var col := Color(0.62, 0.42, 0.22)
+	var msg := ""
+	match String(pr.kind):
+		"crate":
+			inv["wood"] += 2
+			msg = "+2 Wood"
+		"barrel":
+			inv["wood"] += 1
+			if roll < 50:
+				torches_held += 1
+				msg = "+1 Wood, +1 Torch"
+			else:
+				inv["coal"] += 1
+				msg = "+1 Wood, +1 Coal"
+		"pot":
+			col = Color(0.75, 0.42, 0.3)
+			if roll < 35:
+				inv["gold"] += 1
+				msg = "+1 Gold"
+			elif roll < 70:
+				inv["coal"] += 1
+				msg = "+1 Coal"
+			else:
+				torches_held += 1
+				msg = "+1 Torch"
+	if fx != null:
+		fx.burst(pr.position, col, 22, 420.0, 1500.0, 9.0, 0.9)
+		fx.flyer(pr.position, Color(1.0, 0.85, 0.4), msg)
+		fx.shake(5.0)
+		fx.sfx("prop_break")
+		fx.rumble(40)
+	log_event("Smashed a %s: %s" % [pr.kind, msg])
+	print("DEEPFALL_PROP_BROKEN kind=%s loot=%s" % [pr.kind, msg])
+	save_game("prop")
+
+func prop_landed(pr: Node2D, impact: float) -> void:
+	# A prop dropped from height crushes enemies under it.
+	if fx != null:
+		fx.burst(pr.position + Vector2(0, pr.half.y), Color(0.6, 0.55, 0.5), 8, 200.0)
+		fx.shake(minf(8.0, impact / 150.0))
+	for e in enemies.duplicate():
+		if is_instance_valid(e) and Rect2(e.position - Vector2(e.half_w, e.half_h), Vector2(e.half_w, e.half_h) * 2.0).intersects(pr.rect().grow(4.0)):
+			e.take_hit(int(impact / 40.0), pr.position.x, Vector2(0, -300))
+
+func prop_support_y(pr: Node2D, prev_bot: float) -> float:
+	# Top of another prop directly under `pr` (props stack), or -1e9.
+	var best := -1e9
+	for o in phys_props:
+		if o == pr or not is_instance_valid(o):
+			continue
+		var r: Rect2 = o.rect()
+		if absf(o.position.x - pr.position.x) < (o.half.x + pr.half.x) * 0.8 and prev_bot <= r.position.y + 2.0:
+			if best < -1e8 or r.position.y < best:
+				best = r.position.y
+	return best
+
+func slam_impact(pos: Vector2) -> void:
+	# Ground slam shockwave: knocks enemies away + up, launches and
+	# damages props, breaks pots, and shakes the screen.
+	if fx != null:
+		fx.burst(pos, Color(0.85, 0.8, 0.7), 26, 520.0, 1600.0, 8.0, 0.7, 0.3)
+		fx.shake(12.0)
+		fx.hitstop(0.05)
+		fx.sfx("slam")
+		fx.rumble(120)
+	for e in enemies.duplicate():
+		if not is_instance_valid(e):
+			continue
+		var d: Vector2 = e.position - pos
+		if d.length() < 170.0:
+			var dir := 1.0 if d.x >= 0.0 else -1.0
+			e.take_hit(10, pos.x, Vector2(dir * 420.0, -380.0))
+			if fx != null:
+				fx.float_text(e.position + Vector2(0, -50), "10", Color(1, 0.95, 0.6))
+	for pr in phys_props.duplicate():
+		if not is_instance_valid(pr):
+			continue
+		var dp: Vector2 = pr.position - pos
+		if dp.length() < 170.0:
+			var dir2 := 1.0 if dp.x >= 0.0 else -1.0
+			pr.take_hit(1, pos, Vector2(dir2 * 320.0, -420.0))
+	log_event("Ground slam!")
+
+
+# --- Phase 11 self-test: simulated multi-touch play session ---
+
+func _t11_touch(idx: int, pos: Vector2, pressed: bool) -> void:
+	var ev := InputEventScreenTouch.new()
+	ev.index = idx
+	ev.position = pos
+	ev.pressed = pressed
+	Input.parse_input_event(ev)
+
+func _t11_drag(idx: int, pos: Vector2) -> void:
+	var ev := InputEventScreenDrag.new()
+	ev.index = idx
+	ev.position = pos
+	Input.parse_input_event(ev)
+
+func _t11_wait(t: float) -> void:
+	await get_tree().create_timer(t).timeout
+
+func _t11_shot(name: String) -> void:
+	if DisplayServer.get_name() == "headless":
+		return
+	await RenderingServer.frame_post_draw
+	get_viewport().get_texture().get_image().save_png("res://screenshot_p11_%s.png" % name)
+	print("DEEPFALL_P11_SHOT %s" % name)
+
+func _spawn_test_prop(kind: String, c: Vector2i) -> Node2D:
+	var pr: Node2D = PROP_SCRIPT.new()
+	pr.setup(kind, self)
+	pr.position = Vector2((c.x + 0.5) * TILE, (c.y + 1) * TILE - pr.half.y - 0.01)
+	add_child(pr)
+	move_child(pr, player.get_index())
+	phys_props.append(pr)
+	return pr
+
+func _run_selftest_p11() -> void:
+	await _run_selftest_p13_pre()
+	var tu: Node = get_node("TouchUI")
+	var vs: Vector2 = get_viewport().get_visible_rect().size
+	await _t11_wait(0.6)
+	# 1. floating move stick (anywhere on the left half)
+	var x0: float = player.position.x
+	_t11_touch(0, Vector2(300, 420), true)
+	_t11_drag(0, Vector2(380, 420))
+	await _t11_wait(0.35)
+	print("DEEPFALL_P11 move touch_move=%.2f dx=%.1f (expect >0.9, >40)" % [player.touch_move, player.position.x - x0])
+	# 2. JUMP with a SECOND finger while the stick is held
+	var jb: Control = tu.get_node("JumpButton")
+	var jc: Vector2 = jb.position + jb.size * 0.5
+	var y0: float = player.position.y
+	_t11_touch(1, jc, true)
+	await _t11_wait(0.2)
+	print("DEEPFALL_P11 multitouch_jump rose=%.1f vel_y=%.0f (expect >30)" % [y0 - player.position.y, player.vel.y])
+	await _t11_shot("jump")
+	_t11_touch(1, jc, false)
+	_t11_touch(0, Vector2(380, 420), false)
+	await _t11_wait(0.9)
+	print("DEEPFALL_P11 released touch_move=%.2f on_ground=%s" % [player.touch_move, str(player.on_ground)])
+	# 3. knockback is real now
+	var kx: float = player.position.x
+	player.take_hit(1, player.position.x - 30.0)
+	await _t11_wait(0.3)
+	print("DEEPFALL_P11 knockback dx=%.1f (expect > 20)" % (player.position.x - kx))
+	player.hp = player.max_hp
+	await _t11_wait(0.8)
+	# 4. aim stick DOWN with the pickaxe mines the block below
+	set_tool("pickaxe")
+	var sp0: Vector2i = data["spawn"]
+	player.respawn_at(Vector2((sp0.x - 1.5) * TILE, (sp0.y + 0.5) * TILE))
+	await _t11_wait(0.6)
+	var below: Vector2i = _aim_probe(Vector2(0, 1))["cell"]
+	var t_before: int = fg[below.y][below.x] if below.x >= 0 else -1
+	_t11_touch(2, Vector2(vs.x * 0.7, 300), true)
+	_t11_drag(2, Vector2(vs.x * 0.7, 380))
+	await _t11_wait(0.15)
+	await _t11_shot("mine")
+	await _t11_wait(0.75)
+	_t11_touch(2, Vector2(vs.x * 0.7, 380), false)
+	print("DEEPFALL_P11 aim_mine_down cell=%s before=%d after=%d (expect after 0)" % [str(below), t_before, fg[below.y][below.x]])
+	await _t11_wait(1.0)
+	# 5. sword swing up-right via the aim stick hits + knocks back a ghoul
+	var sb: Control = tu._slot_sword
+	_t11_touch(3, sb.position + sb.size * 0.5, true)
+	_t11_touch(3, sb.position + sb.size * 0.5, false)
+	var gc: Vector2i = player.cell() + Vector2i(1, 0)
+	_spawn_one("rock-golem", gc)
+	var g: Node2D = enemies[enemies.size() - 1]
+	var ghp: int = g.hp
+	var gx: float = g.position.x
+	_t11_touch(4, Vector2(vs.x * 0.7, 300), true)
+	_t11_drag(4, Vector2(vs.x * 0.7 + 80, 300))
+	await _t11_wait(0.2)
+	await _t11_shot("sword")
+	await _t11_wait(0.15)
+	_t11_touch(4, Vector2(vs.x * 0.7 + 80, 300), false)
+	print("DEEPFALL_P11 sword tool=%s golem_hp %d->%d pushed=%.1f (expect sword, lower, >10)" % [tool, ghp, g.hp, g.position.x - gx])
+	g.take_hit(999, player.position.x)
+	await _t11_wait(0.5)
+	# 6. push a crate, smash a pot
+	var sp: Vector2i = data["spawn"]
+	player.respawn_at(Vector2((sp.x + 0.5) * TILE, (sp.y + 0.5) * TILE))
+	await _t11_wait(0.6)
+	var pc: Vector2i = player.cell()
+	player.facing = 1
+	var crate := _spawn_test_prop("crate", pc + Vector2i(2, 0))
+	await _t11_wait(0.4)
+	var cx0: float = crate.position.x
+	_t11_touch(0, Vector2(300, 420), true)
+	_t11_drag(0, Vector2(380, 420))
+	await _t11_wait(0.6)
+	await _t11_shot("push")
+	_t11_touch(0, Vector2(380, 420), false)
+	print("DEEPFALL_P11 crate_push dx=%.1f player_overlap=%s (expect >20, false)" % [crate.position.x - cx0, str(player._my_rect().grow(-2).intersects(crate.rect()))])
+	var pot := _spawn_test_prop("pot", player.cell() + Vector2i(-1, 0))
+	await _t11_wait(0.3)
+	var wood0: int = inv["wood"] + inv["coal"] + inv["gold"] + torches_held
+	player.attack_cooldown = 0.0
+	player.try_attack_dir(Vector2(-1, 0))
+	await _t11_wait(0.5)
+	print("DEEPFALL_P11 pot_broken=%s loot_delta=%d (expect true, 1)" % [str(not is_instance_valid(pot)), inv["wood"] + inv["coal"] + inv["gold"] + torches_held - wood0])
+	# 7. DASH and SLAM buttons
+	var db: Control = tu.get_node("DashButton")
+	var dx0: float = player.position.x
+	_t11_touch(5, db.position + db.size * 0.5, true)
+	await _t11_wait(0.12)
+	_t11_touch(5, db.position + db.size * 0.5, false)
+	print("DEEPFALL_P11 dash dx=%.1f cooldown=%.2f (expect |dx|>50, >0)" % [absf(player.position.x - dx0), player.dash_cooldown])
+	await _t11_wait(0.6)
+	_spawn_one("miner-ghoul", player.cell() + Vector2i(2, 0))
+	var g2: Node2D = enemies[enemies.size() - 1]
+	await _t11_wait(0.3)
+	var g2hp: int = g2.hp
+	var slb: Control = tu.get_node("SlamButton")
+	_t11_touch(6, slb.position + slb.size * 0.5, true)
+	_t11_touch(6, slb.position + slb.size * 0.5, false)
+	await _t11_wait(0.5)
+	await _t11_shot("slam")
+	print("DEEPFALL_P11 slam ghoul_hp %d->%d (expect lower)" % [g2hp, g2.hp if is_instance_valid(g2) else -1])
+	await _t11_wait(1.0)
+	await _t11_shot("end")
+	print("DEEPFALL_P11 done hp=%d props=%d" % [player.hp, phys_props.size()])
+	# --- Phase 12: control settings, enemy art, sound ---
+	var g3: Node2D = enemies[0] if not enemies.is_empty() else null
+	print("DEEPFALL_P12 enemy_art tex=%s scale=%.1f (expect enemies_px, 3.0)" % [g3._sprite.texture.resource_path if g3 != null else "none", g3._sprite.scale.y if g3 != null else 0.0])
+	print("DEEPFALL_P12 sfx loaded=%d volume=%.2f" % [fx._streams.size(), fx.volume])
+	var mb: Control = tu.get_node("MenuButton")
+	_t11_touch(7, mb.position + mb.size * 0.5, true)
+	_t11_touch(7, mb.position + mb.size * 0.5, false)
+	await get_tree().process_frame
+	print("DEEPFALL_P12 menu panel=%s paused=%s (expect true, true)" % [str(tu._settings_panel.visible), str(get_tree().paused)])
+	(tu._sliders["stick_scale"] as HSlider).value = 1.4
+	(tu._sliders["button_scale"] as HSlider).value = 1.2
+	await _t11_shot("settings")
+	var jbtn: Control = tu.get_node("JumpButton")
+	print("DEEPFALL_P12 scales stick_r=%.1f jump_radius=%.1f (expect 100.8, 76.8)" % [tu._stick_r, jbtn.radius])
+	tu._start_edit()
+	var jpos: Vector2 = jbtn.position
+	var grab: Vector2 = jbtn.position + jbtn.size * 0.5
+	_t11_touch(8, grab, true)
+	_t11_drag(8, grab + Vector2(-200, -150))
+	_t11_touch(8, grab + Vector2(-200, -150), false)
+	await get_tree().process_frame
+	await _t11_shot("edit")
+	tu._end_edit()
+	tu._layout()
+	print("DEEPFALL_P12 move_button moved=%s saved=%s (expect true, true)" % [str(jbtn.position.distance_to(jpos) > 100.0), str(FileAccess.file_exists("user://deepfall_settings.json"))])
+	(tu._checks["left_handed"] as CheckButton).button_pressed = true
+	tu._close_settings()
+	await get_tree().process_frame
+	_t11_touch(9, Vector2(200, 400), true)
+	await get_tree().process_frame
+	print("DEEPFALL_P12 left_handed left_touch_is_aim=%s paused=%s (expect true, false)" % [str(tu._aim_active), str(get_tree().paused)])
+	_t11_touch(9, Vector2(200, 400), false)
+	await _t11_shot("lefthand")
+	tu._reset_settings()
+	print("DEEPFALL_P12 reset stick_r=%.1f (expect 72)" % tu._stick_r)
+
+
+# --- Phase 13: run summary card ---
+
+func _fmt_time(t: float) -> String:
+	var m := int(t) / 60
+	return "%d:%02d" % [m, int(t) % 60]
+
+func _loot_line() -> String:
+	var parts: Array = []
+	for k in ["gold", "amber", "coal", "stone", "wood", "dirt", "sand", "glass"]:
+		if int(inv.get(k, 0)) > 0:
+			parts.append("%d %s" % [int(inv[k]), k])
+	return "Loot: " + (", ".join(parts) if not parts.is_empty() else "none yet")
+
+func _brag_text() -> String:
+	var how := "made it out alive" if _card_reason == "extract" else "fell"
+	return "DEEPFALL: my %s %s at depth %d after %s. %d kills, %d ore, %d blocks mined, %d props smashed. %s. Can you dig deeper?" % [
+		player.class_display_name, how, _max_depth, _fmt_time(_run_time), kills, ore_collected,
+		_mined_cells.size(), _props_smashed, _loot_line()]
+
+func show_run_card(reason: String) -> void:
+	if _card != null:
+		_card.queue_free()
+	_card_reason = reason
+	_card_open = true
+	get_tree().paused = true
+	var tui: Node = get_node_or_null("TouchUI")
+	if tui != null:
+		tui.call("_release_all")
+	_card = CanvasLayer.new()
+	_card.layer = 30
+	_card.process_mode = Node.PROCESS_MODE_ALWAYS
+	add_child(_card)
+	var vs: Vector2 = get_viewport().get_visible_rect().size
+	var dim := ColorRect.new()
+	dim.color = Color(0, 0, 0, 0.55)
+	dim.size = vs
+	_card.add_child(dim)
+	var panel := PanelContainer.new()
+	panel.name = "RunCard"
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(0.07, 0.06, 0.09, 0.97)
+	sb.border_color = Color(1.0, 0.78, 0.35) if reason == "extract" else Color(0.85, 0.3, 0.3)
+	sb.set_border_width_all(4)
+	sb.set_corner_radius_all(16)
+	sb.set_content_margin_all(22)
+	panel.add_theme_stylebox_override("panel", sb)
+	_card.add_child(panel)
+	var vb := VBoxContainer.new()
+	vb.add_theme_constant_override("separation", 8)
+	panel.add_child(vb)
+	var title := Label.new()
+	title.name = "CardTitle"
+	title.text = "EXTRACTED!" if reason == "extract" else "YOU FELL"
+	title.add_theme_font_size_override("font_size", 40)
+	title.add_theme_color_override("font_color", sb.border_color)
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	vb.add_child(title)
+	var sub := Label.new()
+	sub.text = "%s   ·   run time %s" % [player.class_display_name, _fmt_time(_run_time)]
+	sub.add_theme_font_size_override("font_size", 18)
+	sub.add_theme_color_override("font_color", Color(0.85, 0.82, 0.75))
+	sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	vb.add_child(sub)
+	var hb := HBoxContainer.new()
+	hb.add_theme_constant_override("separation", 22)
+	vb.add_child(hb)
+	var pic := TextureRect.new()
+	pic.texture = _class_idle_texture(player.class_id)
+	pic.custom_minimum_size = Vector2(128, 168)
+	pic.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	pic.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	pic.texture_filter = CanvasItem.TEXTURE_FILTER_NEAREST
+	hb.add_child(pic)
+	var grid := GridContainer.new()
+	grid.name = "CardStats"
+	grid.columns = 2
+	grid.add_theme_constant_override("h_separation", 26)
+	grid.add_theme_constant_override("v_separation", 6)
+	hb.add_child(grid)
+	for row in [["Deepest", "%d" % _max_depth], ["Kills", "%d" % kills], ["Ore", "%d" % ore_collected],
+			["Blocks mined", "%d" % _mined_cells.size()], ["Props smashed", "%d" % _props_smashed], ["Deaths", "%d" % _deaths]]:
+		var kl := Label.new()
+		kl.text = String(row[0])
+		kl.add_theme_font_size_override("font_size", 20)
+		kl.add_theme_color_override("font_color", Color(0.7, 0.68, 0.62))
+		grid.add_child(kl)
+		var vl := Label.new()
+		vl.text = String(row[1])
+		vl.add_theme_font_size_override("font_size", 24)
+		vl.add_theme_color_override("font_color", Color(1, 0.95, 0.8))
+		grid.add_child(vl)
+	var loot := Label.new()
+	loot.name = "CardLoot"
+	loot.text = _loot_line()
+	loot.add_theme_font_size_override("font_size", 17)
+	loot.add_theme_color_override("font_color", Color(1.0, 0.85, 0.45))
+	loot.autowrap_mode = TextServer.AUTOWRAP_WORD
+	loot.custom_minimum_size = Vector2(520, 0)
+	vb.add_child(loot)
+	var foot := Label.new()
+	foot.text = "DEEPFALL  ·  Relics of the Below"
+	foot.add_theme_font_size_override("font_size", 14)
+	foot.add_theme_color_override("font_color", Color(1, 1, 1, 0.4))
+	foot.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	vb.add_child(foot)
+	var btns := HBoxContainer.new()
+	btns.name = "CardButtons"
+	btns.alignment = BoxContainer.ALIGNMENT_CENTER
+	btns.add_theme_constant_override("separation", 14)
+	vb.add_child(btns)
+	var specs: Array = [["SHARE", _share_card], ["KEEP DIGGING", _close_run_card]]
+	if reason == "extract":
+		specs.append(["NEW RUN", _card_new_run])
+	for spec in specs:
+		var b := Button.new()
+		b.name = "Card" + String(spec[0]).replace(" ", "")
+		b.text = String(spec[0])
+		b.custom_minimum_size = Vector2(170, 58)
+		b.add_theme_font_size_override("font_size", 20)
+		b.pressed.connect(spec[1])
+		btns.add_child(b)
+	_card_status = Label.new()
+	_card_status.name = "CardStatus"
+	_card_status.add_theme_font_size_override("font_size", 14)
+	_card_status.add_theme_color_override("font_color", Color(0.6, 1.0, 0.8))
+	_card_status.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_card_status.autowrap_mode = TextServer.AUTOWRAP_WORD
+	vb.add_child(_card_status)
+	panel.reset_size()
+	panel.position = ((vs - panel.size) * 0.5).floor()
+	if fx != null:
+		fx.sfx("pickup" if reason == "extract" else "enemy_die", 0.0)
+	print("DEEPFALL_RUN_CARD reason=%s depth=%d kills=%d ore=%d mined=%d props=%d" % [
+		reason, _max_depth, kills, ore_collected, _mined_cells.size(), _props_smashed])
+
+func _share_card() -> void:
+	# Render just the card to a PNG (buttons hidden), save it on the
+	# device, and put the brag text on the clipboard to paste anywhere.
+	var panel: Control = _card.get_node("RunCard")
+	var btns: Control = panel.get_node("VBoxContainer/CardButtons") if panel.has_node("VBoxContainer/CardButtons") else null
+	var rect := panel.get_global_rect()
+	if btns != null:
+		btns.modulate.a = 0.0
+	_card_status.text = ""
+	await RenderingServer.frame_post_draw
+	var img := get_viewport().get_texture().get_image()
+	if btns != null:
+		btns.modulate.a = 1.0
+	var k: Vector2 = Vector2(img.get_size()) / get_viewport().get_visible_rect().size
+	var r := Rect2i(Vector2i(rect.position * k), Vector2i(rect.size * k)).intersection(Rect2i(Vector2i.ZERO, img.get_size()))
+	var card_img := img.get_region(r)
+	var saved := ProjectSettings.globalize_path("user://deepfall_run_card.png")
+	card_img.save_png("user://deepfall_run_card.png")
+	var pics := OS.get_system_dir(OS.SYSTEM_DIR_PICTURES)
+	if pics != "" and card_img.save_png(pics.path_join("deepfall_run_card.png")) == OK:
+		saved = pics.path_join("deepfall_run_card.png")
+	DisplayServer.clipboard_set(_brag_text())
+	_card_status.text = "Card image saved (%s). Brag text copied: paste it in any chat or post." % saved.get_file()
+	print("DEEPFALL_RUN_CARD_SHARED path=%s size=%s" % [saved, str(card_img.get_size())])
+
+func _close_run_card() -> void:
+	if _card != null:
+		_card.queue_free()
+		_card = null
+	_card_open = false
+	get_tree().paused = false
+	if player.dead:
+		_respawn_timer = 0.05
+
+func _card_new_run() -> void:
+	_close_run_card()
+	new_run()
+
+# --- Phase 13 self-test (runs first inside --selftest-p11) ---
+
+func _run_selftest_p13_pre() -> void:
+	await _t11_wait(0.4)
+	# 1. physical loot: kill a ghoul, drop pops out, then is collected
+	var c0: int = inv["coal"] + inv["stone"]
+	_spawn_one("miner-ghoul", player.cell() + Vector2i(2, 0))
+	var g: Node2D = enemies[enemies.size() - 1]
+	g.take_hit(999, player.position.x)
+	await get_tree().physics_frame
+	var drops := get_children().filter(func(n): return n.get_script() == LOOT_SCRIPT)
+	var corpses := get_children().filter(func(n): return n.get_script() == CORPSE_SCRIPT)
+	print("DEEPFALL_P13 death_anim corpses=%d drops=%d inv_unchanged=%s (expect 1, 1, true)" % [corpses.size(), drops.size(), str(inv["coal"] + inv["stone"] == c0)])
+	await _t11_wait(0.25)
+	await _t11_shot("death")
+	await _t11_wait(1.6)
+	print("DEEPFALL_P13 loot_collected inv_delta=%d corpse_gone=%s (expect 1, true)" % [inv["coal"] + inv["stone"] - c0, str(get_children().filter(func(n): return n.get_script() == CORPSE_SCRIPT).is_empty())])
+	# 2. smashed prop persists through save + reload
+	var target: Node2D = null
+	for pr in phys_props:
+		if pr.has_meta("prop_id"):
+			target = pr
+			break
+	var tid: int = int(target.get_meta("prop_id"))
+	var before := phys_props.size()
+	target.take_hit(99, target.position + Vector2(-10, 0))
+	target.take_hit(99, target.position + Vector2(-10, 0))
+	target.take_hit(99, target.position + Vector2(-10, 0))
+	await get_tree().physics_frame
+	save_game("p13")
+	_rebuild_world(true)
+	await get_tree().physics_frame
+	var still_gone := true
+	for pr in phys_props:
+		if int(pr.get_meta("prop_id", -1)) == tid:
+			still_gone = false
+	print("DEEPFALL_P13 prop_persist id=%d before=%d after_reload=%d gone=%s smashed=%d (expect true, 1+)" % [tid, before, phys_props.size(), str(still_gone), _props_smashed])
+	# 3. ambience running, deeper = lower drone
+	for _i in range(400):
+		fx.update_ambience(0.0)
+	var p_top: float = fx._amb["drone"].pitch_scale
+	for _i in range(400):
+		fx.update_ambience(1.0)
+	print("DEEPFALL_P13 ambience playing=%s drone_pitch top=%.2f deep=%.2f rumble_db=%.1f (expect true, 1.00, <0.8)" % [str(fx._amb["drone"].playing), p_top, fx._amb["drone"].pitch_scale, fx._amb["rumble"].volume_db])
+	# 4. run summary card on death, share, keep digging
+	_max_depth = maxi(_max_depth, 21)
+	player.hp = 1
+	player.hurt_timer = 0.0
+	player.take_hit(5, player.position.x - 10.0)
+	await _t11_wait(1.2)
+	print("DEEPFALL_P13 card_open=%s paused=%s (expect true, true)" % [str(_card_open), str(get_tree().paused)])
+	await _t11_shot("card")
+	await _share_card()
+	print("DEEPFALL_P13 share clipboard_ok=%s file=%s" % [str(DisplayServer.clipboard_get().begins_with("DEEPFALL")), str(FileAccess.file_exists("user://deepfall_run_card.png"))])
+	_close_run_card()
+	await _t11_wait(0.5)
+	print("DEEPFALL_P13 after_card dead=%s paused=%s (expect false, false)" % [str(player.dead), str(get_tree().paused)])
+	await _t11_wait(0.5)

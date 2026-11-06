@@ -19,6 +19,13 @@ config/icon="res://assets/icon/icon-512.png"
 
 window/size/viewport_width=1280
 window/size/viewport_height=720
+window/stretch/mode="canvas_items"
+window/stretch/aspect="expand"
+window/handheld/orientation=4
+
+[editor_plugins]
+
+enabled=PackedStringArray("res://addons/effekseer/plugin.cfg")
 
 [rendering]
 
@@ -30,7 +37,3 @@ textures/vram_compression/import_etc2_astc=true
 
 snap/snap_2d_transforms_to_pixel=true
 snap/snap_2d_vertices_to_pixel=true
-
-[editor_plugins]
-
-enabled=PackedStringArray("res://addons/effekseer/plugin.cfg")

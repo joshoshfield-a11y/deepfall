@@ -23,6 +23,7 @@ const GRAVITY := 1800.0
 const WINDUP := 0.35
 const STRIKE_AT := 0.40
 const COOLDOWN := 1.0
+const PX_SCALE := 3.0
 
 # slug -> {hp, speed, damage, aggro, range, half_w, half_h, walk, attack, wander}
 # walk/attack are EXACT frame counts from assets/enemies/MANIFEST.md:
@@ -75,6 +76,10 @@ var _cooldown_timer := 0.0
 var _hurt_timer := 0.0
 var _kb_timer := 0.0
 var _kb_vel := 0.0
+var _flash_timer := 0.0
+var _half_tex_h := 64.0
+var _squash := 0.0
+var _was_ground := false
 # Phase 9: the cave bat FLIES now (sine hover around its spawn height, no
 # ground collision, no ledge logic). Every other slug stays ground-walking.
 var _flying := false
@@ -98,35 +103,54 @@ func setup(p_slug: String, p_fg: Array, p_player: Node2D, p_main: Node) -> void:
 	_wander = bool(st["wander"])
 	_flying = slug == "cave-bat-swarm"
 	for i in range(int(st["walk"])):
-		_walk_frames.append(load("res://assets/enemies/%s/walk_%d.png" % [slug, i]))
+		_walk_frames.append(load("res://assets/enemies_px/%s/walk_%d.png" % [slug, i]))
 	for i in range(int(st["attack"])):
-		_attack_frames.append(load("res://assets/enemies/%s/attack_%d.png" % [slug, i]))
-	_idle_frame = load("res://assets/enemies/%s/idle.png" % slug)
+		_attack_frames.append(load("res://assets/enemies_px/%s/attack_%d.png" % [slug, i]))
+	# Phase 12: pixel-art frames (build_pixel_enemies.py) at x3, the
+	# same pixel density as the hero. Feet on the canvas bottom row.
+	_idle_frame = load("res://assets/enemies_px/%s/idle.png" % slug)
 	_sprite = Sprite2D.new()
-	_sprite.scale = Vector2(0.5, 0.5)
-	# 256px canvas at 0.5 = 128px tall; feet at +half_h, so the sprite
-	# centre sits half_h - 64 above the node origin.
-	_sprite.position = Vector2(0, half_h - 64.0)
+	_sprite.scale = Vector2(PX_SCALE, PX_SCALE)
+	_half_tex_h = _idle_frame.get_height() * PX_SCALE * 0.5
+	_sprite.position = Vector2(0, half_h - _half_tex_h)
 	_sprite.texture = _idle_frame
 	add_child(_sprite)
 	_wander_dir = 1 if randi() % 2 == 0 else -1
 	_wander_timer = randf_range(1.5, 3.5)
 
-func take_hit(dmg: int, from_x: float) -> void:
+func take_hit(dmg: int, from_x: float, kb: Vector2 = Vector2.ZERO) -> void:
+	# Phase 11: real knockback physics — the hit launches the enemy
+	# (up + away, or along the swing), it slides with friction, bounces
+	# off walls, and its AI is stunned until the impulse plays out.
 	if dead:
 		return
 	hp -= dmg
 	_hurt_timer = 0.15
-	_kb_timer = 0.2
-	_kb_vel = 180.0 if position.x >= from_x else -180.0
+	_flash_timer = 0.09
+	var mass: float = clampf(float(max_hp) / 20.0, 0.6, 2.5)
+	if kb == Vector2.ZERO:
+		kb = Vector2(260.0 if position.x >= from_x else -260.0, -200.0)
+	vel.x = kb.x / mass
+	if not _flying:
+		vel.y = minf(vel.y, kb.y / sqrt(mass))
+	_kb_timer = 0.32
+	_attack_timer = 0.0
+	_squash = 1.0
 	if hp <= 0:
 		_die()
 
 func _die() -> void:
 	dead = true
+	var fxn: Node = main_node.get("fx") if main_node != null else null
+	if fxn != null:
+		fxn.burst(position, Color(0.85, 0.3, 0.35), 18, 380.0, 1200.0, 7.0, 0.8)
+		fxn.shake(6.0)
+		fxn.sfx("enemy_die", 0.12)
+	# Phase 13: species death animation (corpse keeps the knockback
+	# momentum and falls) replaces the generic poof.
+	if main_node != null and main_node.has_method("spawn_enemy_corpse"):
+		main_node.call("spawn_enemy_corpse", self)
 	died.emit(self)
-	if main_node != null and main_node.has_method("spawn_death_fx"):
-		main_node.call("spawn_death_fx", position)
 	queue_free()
 
 func _physics_process(delta: float) -> void:
@@ -149,8 +173,7 @@ func _physics_process(delta: float) -> void:
 	_moving = false
 	if _kb_timer > 0.0:
 		_kb_timer -= delta
-		vel.x = _kb_vel
-		_moving = true
+		vel.x = move_toward(vel.x, 0.0, (900.0 if on_ground else 250.0) * delta)
 	elif _attack_timer > 0.0:
 		# Attacking: planted. Windup first, strike, then finish.
 		vel.x = 0.0
@@ -165,7 +188,11 @@ func _physics_process(delta: float) -> void:
 	else:
 		_ai(delta)
 	var was_ground := on_ground
+	var vx_before := vel.x
 	_move_axis(delta, true)
+	if _kb_timer > 0.0 and vel.x == 0.0 and absf(vx_before) > 120.0:
+		vel.x = -vx_before * 0.45
+		_squash = 1.0
 	if _flying:
 		position.y += vel.y * delta
 		position.y = clampf(position.y, _hover_base_y - 20.0, _hover_base_y + 20.0)
@@ -177,6 +204,9 @@ func _physics_process(delta: float) -> void:
 	if _moving and (_flying or on_ground) and vel.x == 0.0 and _kb_timer <= 0.0 and _attack_timer <= 0.0:
 		_wander_dir = -_wander_dir
 		facing = _wander_dir
+	if on_ground and not _was_ground:
+		_squash = maxf(_squash, 0.7)
+	_was_ground = on_ground
 	_update_animation(delta)
 
 func _ai(delta: float) -> void:
@@ -276,10 +306,30 @@ func _update_animation(delta: float) -> void:
 		idx = int(_anim_time * fps) % frames.size()
 	_sprite.texture = frames[idx]
 	_sprite.flip_h = facing < 0
-	if _hurt_timer > 0.0:
+	# Phase 11 feel: white hit flash, then a red tint; squash on hits /
+	# landings; wind-up telegraph (lean back + warm glow) before strikes;
+	# a gentle idle breathe so standing foes are never frozen.
+	_flash_timer = maxf(0.0, _flash_timer - delta)
+	_squash = maxf(0.0, _squash - delta * 5.0)
+	if _flash_timer > 0.0:
+		_sprite.modulate = Color(3.0, 3.0, 3.0, 1.0)
+	elif _hurt_timer > 0.0:
 		_sprite.modulate = Color(1.0, 0.35, 0.35, 1.0)
+	elif _attack_timer > 0.0 and not _struck:
+		var k := 0.5 + 0.5 * sin(_anim_time * 30.0)
+		_sprite.modulate = Color(1.0 + 0.6 * k, 1.0 + 0.2 * k, 0.8, 1.0)
 	else:
 		_sprite.modulate = Color(1, 1, 1, 1)
+	var sq := sin(_squash * PI) * 0.18
+	var breathe := 0.0 if _moving or _attack_timer > 0.0 else sin(_anim_time * 3.0) * 0.015
+	_sprite.scale = Vector2(PX_SCALE * (1.0 + sq), PX_SCALE * (1.0 - sq + breathe))
+	_sprite.position = Vector2(0, half_h - _half_tex_h * (1.0 - sq + breathe))
+	var lean := 0.0
+	if _attack_timer > 0.0:
+		lean = (-0.12 if not _struck else 0.1) * facing
+	elif _kb_timer > 0.0:
+		lean = signf(vel.x) * 0.15
+	_sprite.rotation = lerpf(_sprite.rotation, lean, minf(1.0, 12.0 * delta))
 
 func _solid(cx: int, cy: int) -> bool:
 	if cx < 0 or cx >= 80 or cy < 0 or cy >= 45:
