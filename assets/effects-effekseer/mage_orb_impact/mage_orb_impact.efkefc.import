@@ -1,0 +1,17 @@
+[remap]
+
+importer="effekseer.effect"
+type="Resource"
+uid="uid://dnslbhwkwfqmg"
+path="res://.godot/imported/mage_orb_impact.efkefc-3ea32239e2bd4690746df3193daaecde.res"
+
+[deps]
+
+source_file="res://assets/effects-effekseer/mage_orb_impact/mage_orb_impact.efkefc"
+dest_files=["res://.godot/imported/mage_orb_impact.efkefc-3ea32239e2bd4690746df3193daaecde.res"]
+
+[params]
+
+scale=1.0
+data_type=0
+compress=true

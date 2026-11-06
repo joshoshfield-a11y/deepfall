@@ -1,0 +1,62 @@
+{
+  "classes": {
+    "red": {
+      "idle": 9,
+      "walk": 9,
+      "shoot": 5,
+      "reload": 4,
+      "thruster": 6,
+      "dying": 6,
+      "walkcycle": 4,
+      "melee": 4,
+      "crouch": 4,
+      "climb": 4,
+      "swim": 3,
+      "fall": 0
+    },
+    "mage": {
+      "idle": 7,
+      "walk": 7,
+      "shoot": 5,
+      "reload": 7,
+      "thruster": 5,
+      "dying": 5,
+      "walkcycle": 4,
+      "melee": 4,
+      "crouch": 4,
+      "climb": 4,
+      "swim": 4,
+      "fall": 0
+    },
+    "tech": {
+      "idle": 9,
+      "walk": 9,
+      "shoot": 5,
+      "walkcycle": 4,
+      "fall": 3,
+      "melee": 4,
+      "reload": 0,
+      "thruster": 6,
+      "dying": 6,
+      "crouch": 4,
+      "climb": 0,
+      "swim": 0
+    }
+  },
+  "excluded": {
+    "mage_shoot": {
+      "file": "cleaned-regen/mage-fresh/r2c5_shoot.png",
+      "reason": "bad/partial frame (dark, truncated) \u2014 excluded from the mage shoot animation; mage shoot is the 5 clean frames r2c0..c4"
+    },
+    "red_swim_frame2": {
+      "file": "multiframe/red-swim-v2/red-soldier-2.png",
+      "reason": "front-facing star-jump pose; red swim loop uses frames 0/1/3 for a clean horizontal loop"
+    }
+  },
+  "notes": [
+    "No fall/land frames exist for red or mage; code reuses thruster frame 0 for airborne and the lowest crouch frame for landing (real frames of that character, not generated). Distinct fall/land poses are still missing.",
+    "Climb frames have ladders baked in (same caveat as the tech climb set); no climb state exists in-game yet, so the sets are staged in the game tree but not driven.",
+    "Mage swim is upright/wading (never goes horizontal); used as-is. Red/mage walk cycles read as 2-pose alternations; used as-is.",
+    "Phase 9: tech dying (r4c3..c8, 6) + thruster (r3c0..c5, 6) + crouch (multiframe/crouch clean PNGs, 4) sliced into the flat player_anim root. Tech reload (r2c5..c8, 4) exists staged but is NOT sliced: no reload mechanic exists in-game, so reload stays loaded-but-untriggered for red/mage and absent for tech. Tech climb/swim still absent (no ladder or water state in-game; climb frames have ladders baked in)."
+  ]
+}
